@@ -1,0 +1,23 @@
+services:
+  openclaw-gateway:
+    # No inbound access needed: Slack connects outbound (Socket Mode) and
+    # terminal access goes through `docker compose run openclaw-cli`, which
+    # shares this container's network namespace and reaches 127.0.0.1:18789
+    # directly regardless of host port publishing. Clearing ports here (rather
+    # than editing the base file) keeps this override-only and driftless
+    # against upstream docker-compose.yml changes.
+    ports: !reset []
+    volumes:
+      - "openclaw_home:/home/node"
+      - "./.openclaw-data/config:/home/node/.openclaw"
+      - "./.openclaw-data/workspace:/home/node/.openclaw/workspace"
+      - "./.openclaw-data/auth-secrets:/home/node/.config/openclaw"
+  openclaw-cli:
+    volumes:
+      - "openclaw_home:/home/node"
+      - "./.openclaw-data/config:/home/node/.openclaw"
+      - "./.openclaw-data/workspace:/home/node/.openclaw/workspace"
+      - "./.openclaw-data/auth-secrets:/home/node/.config/openclaw"
+
+volumes:
+  openclaw_home:
