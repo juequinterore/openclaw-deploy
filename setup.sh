@@ -173,9 +173,12 @@ fi
 # --- 9. Optional: scaffold the multi-agent coordinator (--agents) ---------
 if [[ "$WITH_AGENTS" -eq 1 ]]; then
   log "Scaffolding multi-agent coordinator (--agents)"
-  ALREADY=$(docker compose run --rm openclaw-cli config get tools.agentToAgent.enabled 2>/dev/null | tr -d '[:space:]')
-  if [[ "$ALREADY" == "true" ]]; then
-    log "Agents already configured (tools.agentToAgent.enabled=true) — skipping scaffold"
+  # Idempotency probe reads the config file directly. Do NOT parse `config get`
+  # stdout here: it prints a banner, and (worse) its non-zero exit when the key
+  # is unset would abort this script under `set -e`/`pipefail` — an `if grep`
+  # condition is exempt from errexit and can't take the script down.
+  if grep -q '"agentToAgent"' .openclaw-data/config/openclaw.json 2>/dev/null; then
+    log "Agents already configured (agentToAgent present) — skipping scaffold"
   else
     log "Applying coordinator + echo-bot config"
     docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
