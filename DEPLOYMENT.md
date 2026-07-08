@@ -259,6 +259,13 @@ Key settings, set via `openclaw config set` / `onboard`:
   a direct API call.
 - `agents.defaults.cliBackends.claude-cli.command`:
   `"/home/node/.local/bin/claude"`
+- `agents.defaults.cliBackends.claude-cli.args` / `.resumeArgs`: the full launch
+  flags, including `--allowedTools mcp__openclaw__*`. **Setting only `.command`
+  is not enough** — without these args the CLI process is launched with no
+  allowlist, so **no `mcp__openclaw__*` tools are exposed** and any agent that
+  needs a tool (e.g. a coordinator calling `sessions_send`) has nothing to work
+  with. A lone agent that only answers still works, which can mask the problem.
+  `setup.sh` pins these automatically.
 - `gateway.mode`: `"local"`, `gateway.bind`: `"loopback"`
 
 To switch the default model:
@@ -515,9 +522,15 @@ Claude CLI login, and adds no infrastructure.
 hand the request to a specialist's own session (waiting for the reply), then
 relays that reply to the user in its normal channel message. Because the
 coordinator owns the outbound reply, this is channel-agnostic — no Slack
-thread-binding caveats. And `sessions_send` is in the **`messaging`** tool
-profile, so the coordinator needs no elevated profile (unlike `sessions_spawn`,
-which is `coding`/`full` only — see the note near the end).
+thread-binding caveats.
+
+> **Critical:** `sessions_send` is **not** part of the `messaging` (or any) tool
+> profile — a profile alone will **not** expose it, and the coordinator will
+> silently fall back to non-OpenClaw tooling and fail to route. You must grant it
+> explicitly on the coordinator with `tools.allow: ["sessions_list",
+> "sessions_history", "sessions_send"]`. This is the single most common reason a
+> coordinator "sees" its specialists (via the read tools) but never dispatches to
+> them.
 
 ### Quickest path: `./setup.sh --agents`
 
@@ -532,8 +545,9 @@ It's idempotent — if agents are already configured (`tools.agentToAgent.enable
 is `true`) it skips the scaffold. It provisions:
 
 - **`main`** — the coordinator: `default: true` (front door for unrouted
-  messages), `messaging` profile, with an `AGENTS.md` telling it to relay echo
-  requests to `echo-bot` via `sessions_send`.
+  messages), with `tools.allow: [sessions_list, sessions_history, sessions_send]`
+  (explicitly granting the relay tool — no profile), and an `AGENTS.md` telling it
+  to relay echo requests to `echo-bot` via `sessions_send`.
 - **`echo-bot`** — a persistent specialist whose replies start with the sentinel
   `ECHO-BOT>>`.
 - the three enabling keys (below), and it verifies `echo-bot` responds before
@@ -561,7 +575,7 @@ container's mounted paths:
     defaults: { /* model + claude-cli runtime from setup.sh — leave as-is */ },
     list: [
       { id: "main", default: true,           // front door: unrouted messages land here
-        tools: { profile: "messaging" },      // has sessions_send; minimal privilege
+        tools: { allow: ["sessions_list", "sessions_history", "sessions_send"] }, // grant the relay tool explicitly
         workspace: "/home/node/.openclaw/workspace" },
       { id: "echo-bot",                        // a persistent specialist (own session/memory)
         tools: { profile: "messaging" },       // specialists that touch files/exec use "coding"
@@ -576,8 +590,12 @@ container's mounted paths:
 }
 ```
 
-The three enabling keys, verified against `openclaw config schema`:
+The four enabling keys, verified against `openclaw config schema`:
 
+- **`agents.list[main].tools.allow` includes `sessions_send`** — the coordinator
+  can only relay if the tool is explicitly granted. `sessions_send` is in **no**
+  profile, so `tools.profile` alone leaves the coordinator unable to dispatch.
+  This is the key most easily missed.
 - **`tools.sessions.visibility: "all"`** — scope for `sessions_list/history/send`
   (`self` < `tree` (default) < `agent` < `all`). `all` lets the coordinator
   target other agents' sessions.
@@ -595,8 +613,9 @@ capability; the persona makes the call.
 ### How the round-trip works
 
 1. The user messages the coordinator (the `default` agent) on Slack or in the TUI.
-2. The coordinator picks a specialist and calls `sessions_send(agentId, request,
-   <wait timeout>)`.
+2. The coordinator picks a specialist and calls `sessions_send(key="agent:<id>:main",
+   message=request, timeoutMs=<wait>)`. A standing agent's session key has the form
+   `agent:<id>:main` (e.g. `agent:echo-bot:main`).
 3. The specialist runs in **its own persistent session** (keeps memory across
    calls) and returns its answer inline to the coordinator.
 4. The coordinator relays that answer to the user in its own channel reply — the

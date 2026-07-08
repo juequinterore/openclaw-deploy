@@ -154,6 +154,22 @@ log "Setting default model to anthropic/claude-sonnet-4-6"
 docker compose run --rm openclaw-cli config set \
   agents.defaults.model.primary anthropic/claude-sonnet-4-6
 
+# Pin the FULL claude-cli backend. Setting only `.command` leaves the backend
+# without its `args`, so agents launch with no `--allowedTools mcp__openclaw__*`
+# — meaning NO OpenClaw MCP tools are exposed to the CLI process. A lone agent
+# still answers (it needs no tools), but a coordinator then has nothing to
+# delegate with. These args mirror the known-good partner config.
+log "Pinning full claude-cli backend args (command-only exposes no MCP tools)"
+docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
+{
+  "agents": { "defaults": { "cliBackends": { "claude-cli": {
+    "command": "/home/node/.local/bin/claude",
+    "args": ["-p","--output-format","stream-json","--include-partial-messages","--verbose","--setting-sources","user","--allowedTools","mcp__openclaw__*","--disallowedTools","ScheduleWakeup,CronCreate,Bash(run_in_background:true),Monitor"],
+    "resumeArgs": ["-p","--output-format","stream-json","--include-partial-messages","--verbose","--setting-sources","user","--allowedTools","mcp__openclaw__*","--disallowedTools","ScheduleWakeup,CronCreate,Bash(run_in_background:true),Monitor","--resume","{sessionId}"]
+  } } } }
+}
+JSON
+
 log "Restarting gateway to apply config"
 docker compose restart openclaw-gateway
 sleep 5
@@ -184,7 +200,8 @@ if [[ "$WITH_AGENTS" -eq 1 ]]; then
     docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
 {
   "agents": { "list": [
-    { "id": "main", "default": true, "tools": { "profile": "messaging" },
+    { "id": "main", "default": true,
+      "tools": { "allow": ["sessions_list", "sessions_history", "sessions_send"] },
       "workspace": "/home/node/.openclaw/workspace" },
     { "id": "echo-bot", "tools": { "profile": "messaging" },
       "workspace": "/home/node/.openclaw/agents/echo-bot/workspace" }
@@ -200,8 +217,9 @@ JSON
     docker compose run --rm --entrypoint sh openclaw-cli -lc '
       m=/home/node/.openclaw/workspace; mkdir -p "$m";
       printf "%s\n" "# Front desk (coordinator)" \
-        "Route requests to specialist agents with the sessions_send tool: send the request to the right agent, wait for its reply, then relay that reply to the user." \
-        "For any request to echo text, send it to agent \"echo-bot\" and return its reply verbatim." > "$m/AGENTS.md";
+        "You are a thin router. Delegate to standing specialist agents with the sessions_send tool; do not do specialist work yourself." \
+        "A specialist session key has the form agent:<id>:main." \
+        "To echo text, call sessions_send(key=\"agent:echo-bot:main\", message=\"<text to echo>\", timeoutMs=120000), then return the reply from echo-bot verbatim." > "$m/AGENTS.md";
       e=/home/node/.openclaw/agents/echo-bot/workspace; mkdir -p "$e";
       printf "%s\n" "# echo-bot" \
         "You are a test specialist. Reply to EVERY message with exactly:" \
@@ -213,8 +231,18 @@ JSON
     ER=$(docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
       --agent echo-bot --message "banana" --json --timeout 60)
     if [[ "$ER" == *'ECHO-BOT>>'* ]]; then
-      log "echo-bot OK. Test the coordinator in a FRESH session (existing ones predate the persona):"
-      log "  docker compose run --rm -it openclaw-cli chat --session desk1   (then type: echo: banana)"
+      log "echo-bot OK. Verifying the coordinator relays to it via sessions_send"
+      # A one-shot `agent` run starts a fresh session, so main loads its
+      # coordinator persona (existing chat sessions predate it and won't relay).
+      CR=$(docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
+        --agent main --message "echo: banana" --json --timeout 120)
+      if [[ "$CR" == *'ECHO-BOT>>'* ]]; then
+        log "Coordinator relay OK — main delegated to echo-bot and returned its reply."
+      else
+        log "WARNING: coordinator did not relay (no ECHO-BOT>> in its reply). Confirm main's"
+        log "tools.allow includes sessions_send and that its AGENTS.md loaded. Full output:"
+        log "$CR"
+      fi
     else
       fail "echo-bot did not respond as expected. Full output:
 $ER"
