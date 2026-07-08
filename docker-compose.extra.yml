@@ -28,11 +28,15 @@ services:
       - "${OPENCLAW_AUTH_PROFILE_SECRET_DIR:-./.openclaw-data/auth-secrets}:/home/node/.config/openclaw"
 
 volumes:
-  # `name:` pins the actual Docker volume name to OPENCLAW_HOME_VOLUME (default
-  # openclaw_home). Without it, Compose prefixes the project name — the volume
-  # would really be `<project>_openclaw_home`, so the literal `openclaw_home`
-  # used by the backup/migration commands in DEPLOYMENT.md wouldn't match.
-  # The in-service mount keeps the fixed `openclaw_home` alias so it always
-  # resolves to this entry regardless of the configured name.
+  # Per-deployment home volume for the Claude CLI install + its OAuth login.
+  # The real Docker volume name resolves in this precedence (highest first):
+  #   1. OPENCLAW_HOME_VOLUME  — set it to pin an exact volume (e.g. to attach
+  #      one restored from a backup on another host).
+  #   2. <COMPOSE_PROJECT_NAME>_home  — the default. COMPOSE_PROJECT_NAME
+  #      defaults to the deploy directory's name, so every deployment gets its
+  #      own home volume and two agents on one host never share a Claude login.
+  #   3. openclaw_home  — only if the project name is somehow empty.
+  # The in-service mount keeps the fixed `openclaw_home` alias, so it always
+  # resolves to this entry no matter what the resulting name is.
   openclaw_home:
-    name: ${OPENCLAW_HOME_VOLUME:-openclaw_home}
+    name: ${OPENCLAW_HOME_VOLUME:-${COMPOSE_PROJECT_NAME:-openclaw}_home}

@@ -9,6 +9,13 @@ upstream.
 This is a companion to `docs.openclaw.ai`, not a replacement — it only
 covers decisions and config specific to this instance.
 
+It also doubles as a **template**: one deployment runs one agent, and you copy
+it once per agent — on the same VPS or on separate VPSs. See "Running multiple
+agents on one host" and "Enabling subagents" below. (For a single agent that
+transparently fans work out to specialists behind one Slack channel, you want
+subagents — a config feature of a *single* deployment — not multiple
+deployments.)
+
 ## Repo structure
 
 ```
@@ -75,8 +82,9 @@ Then edit `.env`:
 - Set `OPENCLAW_GATEWAY_TOKEN` (generate with `openssl rand -hex 32`).
 - Uncomment and keep the `OPENCLAW_IMAGE`, `OPENCLAW_CONFIG_DIR`,
   `OPENCLAW_WORKSPACE_DIR`, `OPENCLAW_AUTH_PROFILE_SECRET_DIR`,
-  `OPENCLAW_HOME_VOLUME`, `OPENCLAW_GATEWAY_BIND`, and `COMPOSE_FILE` lines
-  as documented in `.env.example`.
+  `OPENCLAW_GATEWAY_BIND`, and `COMPOSE_FILE` lines as documented in
+  `.env.example`. (Leave the "Multi-agent / advanced" block commented unless
+  you're running several agents on one host.)
 
 ```bash
 docker compose pull openclaw-gateway
@@ -168,7 +176,7 @@ guarantees a fresh read).
 ```bash
 docker compose down
 ```
-This does not delete `.openclaw-data/` or the `openclaw_home` volume — your
+This does not delete `.openclaw-data/` or the home volume — your
 config, sessions, and Claude CLI login all survive.
 
 **Interactive terminal chat:**
@@ -209,11 +217,16 @@ OPENCLAW_IMAGE=ghcr.io/openclaw/openclaw:2026.6.11   # pinned version, not :late
 OPENCLAW_CONFIG_DIR=./.openclaw-data/config
 OPENCLAW_WORKSPACE_DIR=./.openclaw-data/workspace
 OPENCLAW_AUTH_PROFILE_SECRET_DIR=./.openclaw-data/auth-secrets
-OPENCLAW_HOME_VOLUME=openclaw_home                   # persists Claude CLI install+login
 OPENCLAW_GATEWAY_BIND=loopback                       # no inbound network exposure
 OPENCLAW_GATEWAY_TOKEN=<generate with: openssl rand -hex 32>
 COMPOSE_FILE=docker-compose.yml:docker-compose.extra.yml
 ```
+These are the lines `setup.sh` auto-fills. Two more, in the "Multi-agent /
+advanced" block, stay commented and are only for running several agents on one
+host (see that section): `COMPOSE_PROJECT_NAME` (defaults to the deploy
+directory name; namespaces containers and the `<project>_home` volume) and
+`OPENCLAW_HOME_VOLUME` (override the home volume's exact name).
+
 Provider API keys (`ANTHROPIC_API_KEY` etc., near the top of `.env.example`)
 are left commented out on purpose — auth flows through the Claude CLI's own
 OAuth session instead.
@@ -223,10 +236,10 @@ OAuth session instead.
 Adds, on top of the vendored base compose file:
 - `openclaw_home:/home/node` (named volume) on both services, so the Claude
   CLI install and its credentials survive container recreation. The real
-  volume name comes from `OPENCLAW_HOME_VOLUME` (default `openclaw_home`),
-  pinned via the volume's `name:` field so Compose doesn't project-prefix it —
-  that's what makes the literal `openclaw_home` in the backup/migration
-  commands below actually resolve to this volume.
+  volume name is `<COMPOSE_PROJECT_NAME>_home` (project name defaults to the
+  deploy directory), so each deployment gets its own home volume — two agents
+  on one host never share a login. Set `OPENCLAW_HOME_VOLUME` to override with
+  an exact name (e.g. to attach a volume restored from a backup).
 - Bind mounts for config/workspace/auth-secrets, sourced from
   `OPENCLAW_CONFIG_DIR` / `OPENCLAW_WORKSPACE_DIR` /
   `OPENCLAW_AUTH_PROFILE_SECRET_DIR` in `.env`, defaulting to
@@ -267,19 +280,29 @@ regenerated or re-supplied on each machine:
 2. **`.openclaw-data/`** — gitignored. Either copy it from another machine if
    you want to carry over config/sessions/history, or omit it and run
    onboarding fresh (see "First-time setup" above).
-3. **The `openclaw_home` Docker volume** — a *named volume*, local to the
-   Docker daemon it was created on. It does **not** transfer via `git clone`
-   or a file copy. Re-authenticate from scratch on the new machine (the
-   "First-time setup" commands above), or migrate the volume's contents:
+3. **The home Docker volume** — a *named volume*, local to the Docker daemon it
+   was created on. It does **not** transfer via `git clone` or a file copy.
+   Its real name is `<COMPOSE_PROJECT_NAME>_home` (the project name defaults to
+   the deploy directory), so resolve it once and reuse it below. Re-authenticate
+   from scratch on the new machine (the "First-time setup" commands above), or
+   migrate the volume's contents:
    ```bash
+   # resolve the real volume name from the running config (works on both hosts)
+   VOL=$(docker compose config --format json | \
+     python3 -c 'import json,sys;print(json.load(sys.stdin)["volumes"]["openclaw_home"]["name"])')
+
    # on the old machine
-   docker run --rm -v openclaw_home:/v -v "$PWD":/backup alpine \
+   docker run --rm -v "$VOL":/v -v "$PWD":/backup alpine \
      tar czf /backup/openclaw_home.tgz -C /v .
-   # copy openclaw_home.tgz to the new machine, then:
-   docker volume create openclaw_home
-   docker run --rm -v openclaw_home:/v -v "$PWD":/backup alpine \
+   # copy openclaw_home.tgz to the new machine, then (from its deploy dir):
+   VOL=$(docker compose config --format json | \
+     python3 -c 'import json,sys;print(json.load(sys.stdin)["volumes"]["openclaw_home"]["name"])')
+   docker volume create "$VOL"
+   docker run --rm -v "$VOL":/v -v "$PWD":/backup alpine \
      tar xzf /backup/openclaw_home.tgz -C /v
    ```
+   (If you set `OPENCLAW_HOME_VOLUME` to the same value in both `.env` files,
+   the name is fixed and you can skip the `VOL=` lookup.)
 4. **Docker + Compose v2** must be installed on the new machine.
 5. If the new machine needs *inbound* access (e.g. laptop-to-remote-gateway,
    unlike the VPS setup below which needs none) — see "Direct Internet vs.
@@ -409,6 +432,82 @@ people in the Slack workspace can DM or mention the bot, they share the same
 delegated tool authority. Consider allowlisting/mention-gating
 (`docs.openclaw.ai/gateway/security`) if that's not desired for your
 workspace.
+
+## Running multiple agents on one host
+
+One deployment runs one agent. To run several **independent** agents (e.g. each
+connected to a different Slack workspace), stamp out one copy per agent — the
+cleanest model, with fully isolated state, secrets, sessions, and upgrade
+lifecycle. On *separate* VPSs there's nothing extra to do (separate Docker
+daemons). On the *same* host, give each deployment a distinct identity so
+containers and the home volume don't collide:
+
+```bash
+# One directory per agent — the directory name becomes COMPOSE_PROJECT_NAME,
+# which namespaces containers and the `<project>_home` volume automatically.
+git clone <this-repo-url> openclaw-support
+git clone <this-repo-url> openclaw-sales
+cd openclaw-support && ./setup.sh    # own .env, own gateway token, own volume
+cd ../openclaw-sales  && ./setup.sh
+```
+
+- **Distinct directory names are enough** — `COMPOSE_PROJECT_NAME` defaults to
+  the directory name, so `openclaw-support` and `openclaw-sales` get separate
+  containers (`openclaw-support-openclaw-gateway-1`, …) and separate home
+  volumes (`openclaw-support_home`, `openclaw-sales_home`). If two clones would
+  share a directory name, set `COMPOSE_PROJECT_NAME` explicitly in each `.env`
+  (it's in the "Multi-agent / advanced" block of `.env.example`).
+- **Each agent is its own Slack app** — a separate bot + app token, added via
+  `channels add` into that deployment's own config. There's no shared routing.
+- **Data is already isolated** — each deployment's `./.openclaw-data/` and
+  `.env` live in its own directory; nothing is shared between agents.
+- **Ports never conflict** — loopback bind + `ports: !reset []` means no host
+  ports are published, so any number of agents coexist.
+- **Verify isolation** before relying on it:
+  `docker compose config | grep -E 'name:|container_name'` in each directory
+  should show distinct volume/container names.
+
+## Enabling subagents (optional)
+
+If instead you want **one** agent that transparently delegates to specialists
+behind a **single** Slack channel, that's OpenClaw *subagents* — a config
+feature of a single deployment, not multiple deployments. Everything stays in
+one gateway, one container, one Slack app, and **one Claude CLI login** (child
+runs inherit the parent's auth), so no infrastructure changes are needed — the
+setup in this repo already supports it. Turn it on with config:
+
+```bash
+docker compose run --rm openclaw-cli config set agents.defaults.subagents.delegationMode prefer
+# optional: run children on a cheaper model than the parent
+docker compose run --rm openclaw-cli config set agents.defaults.subagents.model anthropic/claude-haiku-4-5
+# concurrency safety valve (default 8) — see sizing note below
+docker compose run --rm openclaw-cli config set agents.defaults.subagents.maxConcurrent 8
+docker compose restart openclaw-gateway
+```
+
+The parent agent decides when to spawn a subagent (via the `sessions_spawn`
+tool) and synthesizes the result back into the same Slack channel, so the user
+talks to one bot and doesn't need to know specialists exist. See
+`docs.openclaw.ai/tools/subagents` for the full field list
+(`agents.defaults.subagents.*`, `tools.subagents.tools.{allow,deny}`,
+per-agent `agents.list[].subagents.*`).
+
+Two things to keep in mind:
+
+- **Sizing.** Subagents are concurrent `claude` CLI processes inside the one
+  container (up to `maxConcurrent`), each with its own context and token spend.
+  A subagent-heavy deployment wants a larger VPS and will cost more per request
+  than a single-agent one — pointing children at a cheaper model helps.
+- **Optional sandboxing.** If you want subagents to run sandboxed
+  (`sandbox: require`), that needs the Docker CLI + socket — uncomment the
+  `/var/run/docker.sock` mount and `group_add`/`DOCKER_GID` block in
+  `docker-compose.yml` (kept commented by default). Not required for the
+  default (logical session isolation).
+- **Routing caveat.** Delegation is decided by the parent model, not by fixed
+  rules; for "requests of type X always go to specialist Y" you shape it via
+  prompt/config. Persistent thread-binding of follow-ups to a specific subagent
+  is documented for Discord/Matrix/Telegram/iMessage — confirm current Slack
+  behavior in the upstream docs before relying on it for Slack threads.
 
 ## Troubleshooting notes learned while setting this up
 

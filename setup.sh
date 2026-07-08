@@ -35,11 +35,13 @@ if ! grep -qE '^OPENCLAW_GATEWAY_TOKEN=.+' .env; then
 fi
 
 # Uncomment every "# KEY=value" line from the "Docker deployment overrides"
-# marker to end of file — that section is deliberately last in .env.example
-# so this range never touches unrelated commented examples earlier in the
-# file (e.g. the generic OPENCLAW_AUTH_PROFILE_SECRET_DIR placeholder under
-# "Gateway auth + paths").
-START_LINE=$(grep -n "Docker deployment overrides" .env | head -1 | cut -d: -f1 || true)
+# marker to end of file. That block is deliberately last in .env.example so the
+# range never touches unrelated commented examples earlier in the file (e.g. the
+# generic OPENCLAW_AUTH_PROFILE_SECRET_DIR placeholder under "Gateway auth +
+# paths"), nor the "Multi-agent / advanced" block just above the marker —
+# COMPOSE_PROJECT_NAME and OPENCLAW_HOME_VOLUME are meant to stay commented so
+# each deployment keeps its auto-namespaced defaults.
+START_LINE=$(grep -n "Docker deployment overrides (auto-configured" .env | head -1 | cut -d: -f1 || true)
 if [[ -n "${START_LINE:-}" ]]; then
   log "Uncommenting deployment-override variables in .env"
   sed -i.bak "${START_LINE},\$ s/^# \([A-Z_][A-Z0-9_]*=\)/\1/" .env && rm -f .env.bak
@@ -51,8 +53,10 @@ fi
 # Compose reads .env as the invoking user (the owner), so 0600 doesn't break it.
 chmod 600 .env
 
+# OPENCLAW_HOME_VOLUME is intentionally NOT required — it's an optional override.
+# Left unset, the home volume auto-namespaces to <COMPOSE_PROJECT_NAME>_home.
 for var in OPENCLAW_IMAGE OPENCLAW_CONFIG_DIR OPENCLAW_WORKSPACE_DIR \
-           OPENCLAW_AUTH_PROFILE_SECRET_DIR OPENCLAW_HOME_VOLUME \
+           OPENCLAW_AUTH_PROFILE_SECRET_DIR \
            OPENCLAW_GATEWAY_BIND COMPOSE_FILE; do
   grep -qE "^${var}=.+" .env || fail "$var is not set in .env. Edit it manually (see .env.example), then re-run this script."
 done
