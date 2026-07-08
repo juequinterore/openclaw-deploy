@@ -509,6 +509,139 @@ Two things to keep in mind:
   is documented for Discord/Matrix/Telegram/iMessage — confirm current Slack
   behavior in the upstream docs before relying on it for Slack threads.
 
+## Single point of contact → persistent specialists (coordinator pattern)
+
+Goal: one Slack channel (or one TUI session) where a user talks to a single
+agent, and that agent decides — by the *content* of the request — which
+specialist handles it, transparently. Unlike bare subagents (ephemeral runs),
+here each specialist is a **persistent agent definition** with its own model,
+tools, skills, and workspace; unlike separate deployments, they all live in
+**one gateway sharing one Claude CLI login**, so this is still a single
+deployment of this template — no infra change.
+
+**How it composes** (OpenClaw has no turnkey "coordinator", so you build it from
+two primitives):
+- The existing `main` agent is the **coordinator** — the default binding for the
+  channel, so every inbound message lands on it.
+- **Specialists** are extra entries in `agents.list[]`, each with its own
+  capabilities.
+- The coordinator dispatches with the subagents `sessions_spawn` tool using the
+  `agentId` parameter, which runs the child **as** a chosen specialist
+  (inheriting that specialist's model/tools/workspace). The child's result
+  announces back to the requester conversation.
+
+### Target `openclaw.json`
+
+The config lives at `./.openclaw-data/config/openclaw.json` (bind-mounted). Aim
+for this shape — `main` is the coordinator, `coder`/`researcher` are persistent
+specialists with distinct capabilities:
+
+```json5
+{
+  agents: {
+    list: [
+      {
+        id: "main",                       // coordinator / front door
+        subagents: {
+          allowAgents: ["coder", "researcher"],  // who it may dispatch to
+          requireAgentId: false,
+          maxConcurrent: 4,               // concurrent claude processes — size the VPS
+        },
+      },
+      {
+        id: "coder",
+        model: "anthropic/claude-opus-4-6",
+        tools: { allow: ["read", "write", "edit", "exec"] },
+      },
+      {
+        id: "researcher",
+        model: "anthropic/claude-sonnet-4-6",
+        tools: { allow: ["read", "exec"], deny: ["write", "edit"] },
+      },
+    ],
+  },
+  bindings: [
+    { agentId: "main", match: { channel: "slack", accountId: "*" } },
+  ],
+}
+```
+
+Per-agent personality/dispatch instructions go in each agent's workspace files
+(`SOUL.md` / `AGENTS.md`) — that's where you tell `main` *which* specialist
+handles what.
+
+**Applying it:** the exact mutation CLI varies by OpenClaw version — the docs
+reference both an `agents` subcommand and `config set ... --strict-json`, and
+don't pin down the per-item path for `agents.list[]`. Check what your image
+supports first, then use whichever is real:
+
+```bash
+docker compose run --rm openclaw-cli config --help          # see available verbs
+docker compose run --rm openclaw-cli agents --help 2>/dev/null || true
+# Either set the whole array as JSON (merge to avoid dropping `main`):
+docker compose run --rm openclaw-cli config set agents.list '<json-array>' --strict-json --merge
+# ...or edit ./.openclaw-data/config/openclaw.json directly, then:
+docker compose restart openclaw-gateway
+```
+
+Keep any per-agent `workspace:` paths under `/home/node/.openclaw` so they land
+in the bind-mounted data dir and survive restarts.
+
+### Smoke test in the TUI (no Slack needed)
+
+You do **not** need Slack to validate the dispatch logic — the local TUI is a
+requester channel too, and it gives more visibility than Slack would. Test in
+three steps:
+
+```bash
+# 1. Each specialist runs with ITS OWN capabilities (non-interactive, inspectable).
+#    Check resolvedModel / executionTrace in the JSON — coder should be on opus.
+docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
+  --agent coder --message "what model are you and can you write files?" --json --timeout 60
+docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
+  --agent researcher --message "ping" --json --timeout 60
+
+# 2. Coordinator dispatch — interactive, because spawn is async (a one-shot
+#    `agent` call can return before the child announces; the TUI lets you watch).
+docker compose run --rm -it openclaw-cli chat        # talks to `main` (coordinator)
+#   › ask something that should route to a specialist, e.g.
+#     "refactor this Python function ..."  (should go to coder)
+#   › then inspect what actually happened:
+#       /subagents list          # shows the child run and which agent id it ran as
+#       /subagents log <id>       # the child transcript
+#       /subagents info <id>      # status + resolved model/provider
+```
+
+Step 1 proves each specialist's capabilities are live; step 2 proves the
+coordinator decides by content, dispatches to the right specialist, and the
+answer returns to the requester conversation.
+
+### What the TUI test does and doesn't cover
+
+- ✅ **Covers the core risk** — coordinator content-based dispatch, specialists
+  running with their own model/tools, and results returning to the requester.
+- ❌ **Does not cover Slack-specific delivery.** Verified from the docs: Slack is
+  **not** among the channels with a conversation-binding adapter (Discord,
+  iMessage, Matrix, Telegram are), so on Slack a subagent cannot stay
+  thread-bound — follow-ups return to the coordinator, which re-dispatches, and
+  specialists don't retain per-thread memory across turns. The base
+  announce-back to the originating Slack conversation is documented, but the
+  exact delivery/fallback fields aren't — confirm those with one real Slack
+  message when you wire it up.
+- ⚠️ **Agent-to-agent messaging** (`tools.agentToAgent`) is an alternative
+  dispatch path where specialists keep persistent per-conversation memory, but
+  its return-path behavior (does the reply reach the original user?) is
+  **undocumented** — test it live before relying on it. The subagent `agentId`
+  path above is the better-documented default.
+
+### When to skip the coordinator
+
+If you can dispatch by *identity* instead of content — different Slack
+channels/workspaces/users to different agents — use plain `bindings` (see the
+precedence list under `docs.openclaw.ai/channels/channel-routing`; the
+`team`/`channel`/`peer` tiers cover Slack). It's fully deterministic, fully
+documented, and needs no coordinator or subagents.
+
 ## Troubleshooting notes learned while setting this up
 
 - **`pull access denied for openclaw, repository does not exist`** —
