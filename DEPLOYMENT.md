@@ -57,6 +57,19 @@ Then edit `.env`:
 docker compose pull openclaw-gateway
 ```
 
+**On Linux (e.g. a VPS), pre-create the data dirs with the right ownership**
+before anything mounts them. The container runs as uid 1000 (`node`); if
+Docker auto-creates these directories on first mount (which it will, if you
+skip this), they end up owned by whatever user ran `docker compose` —
+typically `root` on a fresh VPS — and the container gets
+`EACCES: permission denied` trying to write into them. This isn't an issue
+on macOS Docker Desktop (its file-sharing layer doesn't enforce the same
+uid/gid model), which is why it may not show up until a real Linux host:
+```bash
+mkdir -p .openclaw-data/config .openclaw-data/workspace .openclaw-data/auth-secrets
+sudo chown -R 1000:1000 .openclaw-data
+```
+
 Create the base config first — the gateway refuses to start (crash-loops)
 until `openclaw.json` exists:
 ```bash
@@ -308,10 +321,20 @@ git clone <this-repo-url> ~/openclaw-deploy
 ```bash
 cd ~/openclaw-deploy
 cp .env.example .env
-# edit .env: set OPENCLAW_GATEWAY_TOKEN, review the rest
+# edit .env: set OPENCLAW_GATEWAY_TOKEN, uncomment the deployment-override block
 ```
 Or `scp`/`rsync` an existing `.env` and `.openclaw-data/` from another
 machine if you want to carry over config/history instead of starting fresh.
+
+If starting fresh, pre-create the data dirs with the right ownership before
+anything mounts them — the container runs as uid 1000, and on Linux (e.g.
+running as `root` on a fresh VPS) Docker will otherwise auto-create these
+owned by whoever ran `docker compose`, causing
+`EACCES: permission denied` inside the container:
+```bash
+mkdir -p .openclaw-data/config .openclaw-data/workspace .openclaw-data/auth-secrets
+sudo chown -R 1000:1000 .openclaw-data
+```
 
 ### 5. Bring it up
 ```bash
@@ -371,6 +394,20 @@ workspace.
 
 ## Troubleshooting notes learned while setting this up
 
+- **`pull access denied for openclaw, repository does not exist`** —
+  `OPENCLAW_IMAGE` isn't actually set; Compose fell back to the
+  `docker-compose.yml` default (`openclaw:local`), which was never
+  published anywhere. Usually means `.env` doesn't exist yet, or exists but
+  still has the deployment-override block commented out. Check with
+  `docker compose config | grep image:` — it should show
+  `ghcr.io/openclaw/openclaw:...`, not `openclaw:local`.
+- **`EACCES: permission denied, mkdir '/home/node/.openclaw/state'`** (or
+  similar under `/home/node/.openclaw/...`) — the container runs as uid
+  1000, but Docker auto-created the bind-mounted `.openclaw-data/...`
+  directories owned by whoever ran `docker compose` (typically `root` on a
+  fresh Linux VPS). Fix: `mkdir -p .openclaw-data/{config,workspace,auth-secrets}
+  && sudo chown -R 1000:1000 .openclaw-data`, then retry. Doesn't happen on
+  macOS Docker Desktop (different file-sharing permission model).
 - **`Unknown command: openclaw /home/node/.local/bin/claude`** — you ran a
   shell command against `openclaw-cli` without overriding its entrypoint.
   Add `--entrypoint sh ... -lc '...'` (see above).
