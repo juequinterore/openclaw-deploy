@@ -45,6 +45,12 @@ if [[ -n "${START_LINE:-}" ]]; then
   sed -i.bak "${START_LINE},\$ s/^# \([A-Z_][A-Z0-9_]*=\)/\1/" .env && rm -f .env.bak
 fi
 
+# Lock down .env to owner-only — it holds the gateway token. Done last, after
+# the sed edits above: `sed -i` writes a fresh file and can reset the mode to
+# the umask default, so chmod here guarantees the final state is 0600.
+# Compose reads .env as the invoking user (the owner), so 0600 doesn't break it.
+chmod 600 .env
+
 for var in OPENCLAW_IMAGE OPENCLAW_CONFIG_DIR OPENCLAW_WORKSPACE_DIR \
            OPENCLAW_AUTH_PROFILE_SECRET_DIR OPENCLAW_HOME_VOLUME \
            OPENCLAW_GATEWAY_BIND COMPOSE_FILE; do
