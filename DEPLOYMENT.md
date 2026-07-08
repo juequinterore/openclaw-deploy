@@ -222,8 +222,14 @@ OAuth session instead.
 
 Adds, on top of the vendored base compose file:
 - `openclaw_home:/home/node` (named volume) on both services, so the Claude
-  CLI install and its credentials survive container recreation.
-- Explicit bind mounts for config/workspace/auth-secrets pointing at
+  CLI install and its credentials survive container recreation. The real
+  volume name comes from `OPENCLAW_HOME_VOLUME` (default `openclaw_home`),
+  pinned via the volume's `name:` field so Compose doesn't project-prefix it —
+  that's what makes the literal `openclaw_home` in the backup/migration
+  commands below actually resolve to this volume.
+- Bind mounts for config/workspace/auth-secrets, sourced from
+  `OPENCLAW_CONFIG_DIR` / `OPENCLAW_WORKSPACE_DIR` /
+  `OPENCLAW_AUTH_PROFILE_SECRET_DIR` in `.env`, defaulting to
   `./.openclaw-data/...` (project-local instead of `~/.openclaw`).
 - `ports: !reset []` on `openclaw-gateway` — clears the base file's port
   publishing. With `gateway.bind: loopback`, the app only listens on the
@@ -444,5 +450,5 @@ workspace.
   (it shares the same network namespace).
 - **This repo has no `Dockerfile` and no application source, on purpose** —
   don't `git clone` the full `openclaw/openclaw` project expecting to find
-  more here; everything needed to run is these four files plus the pulled
-  image.
+  more here; everything needed to run is in this repo (the two compose files
+  plus your `.env`) alongside the pulled image.

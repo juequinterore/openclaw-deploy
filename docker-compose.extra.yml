@@ -8,16 +8,31 @@ services:
     # against upstream docker-compose.yml changes.
     ports: !reset []
     volumes:
+      # Named volume for /home/node so the Claude CLI install + its OAuth login
+      # survive container recreation. The real volume name is set via the
+      # top-level `volumes:` block below (see the note there).
       - "openclaw_home:/home/node"
-      - "./.openclaw-data/config:/home/node/.openclaw"
-      - "./.openclaw-data/workspace:/home/node/.openclaw/workspace"
-      - "./.openclaw-data/auth-secrets:/home/node/.config/openclaw"
+      # Project-local data dirs. Sources come from .env (the values documented
+      # in .env.example / DEPLOYMENT.md), falling back to ./.openclaw-data/*
+      # so the deployment still works project-local even if a var is unset.
+      # Same container targets as the upstream base file, so these override its
+      # mounts rather than adding new ones.
+      - "${OPENCLAW_CONFIG_DIR:-./.openclaw-data/config}:/home/node/.openclaw"
+      - "${OPENCLAW_WORKSPACE_DIR:-./.openclaw-data/workspace}:/home/node/.openclaw/workspace"
+      - "${OPENCLAW_AUTH_PROFILE_SECRET_DIR:-./.openclaw-data/auth-secrets}:/home/node/.config/openclaw"
   openclaw-cli:
     volumes:
       - "openclaw_home:/home/node"
-      - "./.openclaw-data/config:/home/node/.openclaw"
-      - "./.openclaw-data/workspace:/home/node/.openclaw/workspace"
-      - "./.openclaw-data/auth-secrets:/home/node/.config/openclaw"
+      - "${OPENCLAW_CONFIG_DIR:-./.openclaw-data/config}:/home/node/.openclaw"
+      - "${OPENCLAW_WORKSPACE_DIR:-./.openclaw-data/workspace}:/home/node/.openclaw/workspace"
+      - "${OPENCLAW_AUTH_PROFILE_SECRET_DIR:-./.openclaw-data/auth-secrets}:/home/node/.config/openclaw"
 
 volumes:
+  # `name:` pins the actual Docker volume name to OPENCLAW_HOME_VOLUME (default
+  # openclaw_home). Without it, Compose prefixes the project name — the volume
+  # would really be `<project>_openclaw_home`, so the literal `openclaw_home`
+  # used by the backup/migration commands in DEPLOYMENT.md wouldn't match.
+  # The in-service mount keeps the fixed `openclaw_home` alias so it always
+  # resolves to this entry regardless of the configured name.
   openclaw_home:
+    name: ${OPENCLAW_HOME_VOLUME:-openclaw_home}
