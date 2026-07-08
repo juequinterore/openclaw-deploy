@@ -616,6 +616,64 @@ Step 1 proves each specialist's capabilities are live; step 2 proves the
 coordinator decides by content, dispatches to the right specialist, and the
 answer returns to the requester conversation.
 
+### Quickstart: a throwaway `echo-bot` to exercise the plumbing
+
+If you don't have real specialists designed yet, drop in a trivial one whose
+replies are unmistakable, so you can confirm dispatch end-to-end in minutes.
+
+1. Add `echo-bot` alongside `main`. Either merge this into
+   `./.openclaw-data/config/openclaw.json` or apply with `config set` (confirm
+   the syntax first, per the note above):
+   ```json5
+   {
+     agents: {
+       list: [
+         { id: "main", subagents: { allowAgents: ["echo-bot"], requireAgentId: false } },
+         { id: "echo-bot", workspace: "/home/node/.openclaw/agents/echo-bot/workspace" },
+       ],
+     },
+     bindings: [ { agentId: "main", match: { channel: "slack", accountId: "*" } } ],
+   }
+   ```
+
+2. Give `echo-bot` a one-line persona that makes its output a sentinel. Write it
+   *from inside the container* so it's owned by uid 1000 (avoids the Linux
+   permission gotcha):
+   ```bash
+   docker compose run --rm --entrypoint sh openclaw-cli -lc '
+     d=/home/node/.openclaw/agents/echo-bot/workspace; mkdir -p "$d";
+     printf "%s\n" "# echo-bot" \
+       "You are a test specialist. Reply to EVERY message with exactly:" \
+       "ECHO-BOT>> <repeat the user message verbatim>" > "$d/AGENTS.md" '
+   docker compose restart openclaw-gateway
+   ```
+
+3. Verify. The sentinel `ECHO-BOT>>` only appears if the specialist actually ran:
+   ```bash
+   # (a) specialist directly — expect "ECHO-BOT>>" in the reply text
+   docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
+     --agent echo-bot --message "banana" --json --timeout 60
+
+   # (b) dispatch through the coordinator — interactive
+   docker compose run --rm -it openclaw-cli chat
+   #   › "ask the echo-bot specialist to echo: banana"   (explicit — tests plumbing)
+   #   › expect a reply containing  ECHO-BOT>> banana
+   #   › /subagents list     → confirm a child ran with agent id "echo-bot"
+   #   › /subagents info <id> → confirm its resolved agent/model
+   ```
+
+4. Tear it down when done: remove the `echo-bot` entry from `agents.list` (and
+   `allowAgents`), then:
+   ```bash
+   docker compose run --rm --entrypoint sh openclaw-cli -lc \
+     'rm -rf /home/node/.openclaw/agents/echo-bot'
+   docker compose restart openclaw-gateway
+   ```
+
+Seeing `ECHO-BOT>>` come back through the coordinator in step 3(b) — with
+`/subagents list` showing the `echo-bot` child — is the whole pattern working,
+proven without touching Slack.
+
 ### What the TUI test does and doesn't cover
 
 - ✅ **Covers the core risk** — coordinator content-based dispatch, specialists
