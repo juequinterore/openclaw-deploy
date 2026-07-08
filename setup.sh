@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# Automates the "First-time setup" flow documented in DEPLOYMENT.md.
+# Safe to re-run: every step checks whether it's already done and skips if so.
+#
+# One step genuinely cannot be automated: Claude CLI login is an interactive
+# browser OAuth flow. The script pauses there, prints the command to run in
+# another terminal, and waits for you to press Enter once it's done.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+log()  { printf '\n\033[1;36m==>\033[0m %s\n' "$1"; }
+fail() { printf '\033[1;31mERROR:\033[0m %s\n' "$1" >&2; exit 1; }
+
+command -v docker >/dev/null 2>&1 || fail "docker not found. Install Docker first."
+docker compose version >/dev/null 2>&1 || fail "docker compose v2 not found."
+
+# --- 1. .env -----------------------------------------------------------
+if [[ ! -f .env ]]; then
+  log "Creating .env from .env.example"
+  cp .env.example .env
+else
+  log ".env already exists, leaving its existing values alone"
+fi
+
+if ! grep -qE '^OPENCLAW_GATEWAY_TOKEN=.+' .env; then
+  TOKEN=$(openssl rand -hex 32)
+  if grep -q '^OPENCLAW_GATEWAY_TOKEN=' .env; then
+    sed -i.bak "s|^OPENCLAW_GATEWAY_TOKEN=.*|OPENCLAW_GATEWAY_TOKEN=${TOKEN}|" .env && rm -f .env.bak
+  else
+    printf '\nOPENCLAW_GATEWAY_TOKEN=%s\n' "$TOKEN" >> .env
+  fi
+  log "Generated OPENCLAW_GATEWAY_TOKEN"
+fi
+
+# Uncomment every "# KEY=value" line from the "Docker deployment overrides"
+# marker to end of file — that section is deliberately last in .env.example
+# so this range never touches unrelated commented examples earlier in the
+# file (e.g. the generic OPENCLAW_AUTH_PROFILE_SECRET_DIR placeholder under
+# "Gateway auth + paths").
+START_LINE=$(grep -n "Docker deployment overrides" .env | head -1 | cut -d: -f1 || true)
+if [[ -n "${START_LINE:-}" ]]; then
+  log "Uncommenting deployment-override variables in .env"
+  sed -i.bak "${START_LINE},\$ s/^# \([A-Z_][A-Z0-9_]*=\)/\1/" .env && rm -f .env.bak
+fi
+
+for var in OPENCLAW_IMAGE OPENCLAW_CONFIG_DIR OPENCLAW_WORKSPACE_DIR \
+           OPENCLAW_AUTH_PROFILE_SECRET_DIR OPENCLAW_HOME_VOLUME \
+           OPENCLAW_GATEWAY_BIND COMPOSE_FILE; do
+  grep -qE "^${var}=.+" .env || fail "$var is not set in .env. Edit it manually (see .env.example), then re-run this script."
+done
+
+# --- 2. Pull image -------------------------------------------------------
+log "Pulling pinned OpenClaw image"
+docker compose pull openclaw-gateway
+IMAGE_RESOLVED=$(docker compose config 2>/dev/null | grep -m1 'image:' | awk '{print $2}')
+[[ "$IMAGE_RESOLVED" != "openclaw:local" ]] || fail "OPENCLAW_IMAGE still resolves to openclaw:local — check .env."
+
+# --- 3. Data dirs, with the Linux uid-1000 permission fix -----------------
+log "Creating data directories"
+mkdir -p .openclaw-data/config .openclaw-data/workspace .openclaw-data/auth-secrets
+if [[ "$(uname -s)" == "Linux" ]]; then
+  log "Linux detected: chowning data dirs to uid 1000 (the container's node user)"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown -R 1000:1000 .openclaw-data
+  else
+    sudo chown -R 1000:1000 .openclaw-data
+  fi
+fi
+
+# --- 4. Base config (auth deferred) --------------------------------------
+if [[ ! -f .openclaw-data/config/openclaw.json ]]; then
+  log "Creating base OpenClaw config"
+  docker compose run --rm --no-deps --entrypoint node openclaw-gateway \
+    dist/index.js onboard --mode local --no-install-daemon \
+    --non-interactive --accept-risk --auth-choice skip \
+    --gateway-bind loopback --skip-channels --skip-skills --skip-hooks --skip-search --skip-health
+else
+  log "openclaw.json already exists, skipping base onboarding"
+fi
+
+log "Starting gateway"
+docker compose up -d openclaw-gateway
+sleep 5
+docker compose ps
+
+# --- 5. Claude CLI install -------------------------------------------------
+log "Installing Claude Code CLI inside the container (persists in the openclaw_home volume)"
+docker compose run --rm --entrypoint sh openclaw-cli -lc \
+  'test -x /home/node/.local/bin/claude || curl -fsSL https://claude.ai/install.sh | bash'
+
+# --- 6. Interactive login — cannot be scripted ----------------------------
+claude_logged_in() {
+  docker compose run --rm --entrypoint sh openclaw-cli -lc \
+    '/home/node/.local/bin/claude auth status' 2>/dev/null | grep -q '"loggedIn": *true'
+}
+
+if claude_logged_in; then
+  log "Claude CLI already authenticated, skipping login"
+else
+  log "Claude CLI needs interactive login (browser OAuth) — this cannot be scripted."
+  echo
+  echo "  Run this in another terminal now:"
+  echo
+  echo "    cd '$SCRIPT_DIR' && docker compose run --rm -it --entrypoint sh openclaw-cli -lc '/home/node/.local/bin/claude auth login'"
+  echo
+  read -r -p "Press Enter once login is complete... " _
+  claude_logged_in || fail "Claude CLI still not authenticated. Re-run this script after logging in."
+fi
+
+# --- 7. Wire up agent runtime + default model -----------------------------
+log "Configuring claude-cli backend command"
+docker compose run --rm openclaw-cli config set \
+  agents.defaults.cliBackends.claude-cli.command /home/node/.local/bin/claude
+
+log "Running onboard --auth-choice anthropic-cli"
+docker compose run --rm --no-deps --entrypoint node openclaw-gateway \
+  dist/index.js onboard --mode local --no-install-daemon \
+  --non-interactive --accept-risk --auth-choice anthropic-cli \
+  --gateway-bind loopback --skip-channels --skip-skills --skip-hooks --skip-search --skip-health
+
+log "Setting default model to anthropic/claude-sonnet-4-6"
+docker compose run --rm openclaw-cli config set \
+  agents.defaults.model.primary anthropic/claude-sonnet-4-6
+
+log "Restarting gateway to apply config"
+docker compose restart openclaw-gateway
+sleep 5
+
+# --- 8. Verify end to end --------------------------------------------------
+log "Running end-to-end verification"
+RESULT=$(docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
+  --agent main --message "Reply with exactly: SETUP_SCRIPT_OK" --json --timeout 60)
+
+if echo "$RESULT" | grep -q '"winnerProvider": *"claude-cli"' && echo "$RESULT" | grep -q 'SETUP_SCRIPT_OK'; then
+  log "SUCCESS — agent responded correctly via claude-cli."
+else
+  fail "Verification failed. Full output:
+$RESULT"
+fi
+
+log "Done. Try: docker compose run --rm -it openclaw-cli chat"
+echo "To add Slack, see the 'Wire up Slack' section in DEPLOYMENT.md."

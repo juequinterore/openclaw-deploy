@@ -16,12 +16,13 @@ docker-compose.yml          # vendored from upstream, pinned to tag v2026.6.11
 docker-compose.extra.yml    # our overrides: home volume, data-dir mounts, no ports
 .env.example                # template — copy to .env and fill in
 .gitignore                  # excludes .env and .openclaw-data/
+setup.sh                    # automates "First-time setup" below; safe to re-run
 DEPLOYMENT.md                # this file
 ```
 
 No `Dockerfile`, no application source, nothing else — verified: `docker
-compose up -d` works from a directory containing only the four files above,
-because `OPENCLAW_IMAGE` is pinned and already resolvable by tag, so Compose
+compose up -d` works from a directory containing only the compose files
+above, because `OPENCLAW_IMAGE` is pinned and already resolvable by tag, so Compose
 never touches the `build: .` fallback in `docker-compose.yml`.
 
 ## Summary of this setup
@@ -39,6 +40,30 @@ never touches the `build: .` fallback in `docker-compose.yml`.
   checkout is portable without leaking secrets into git.
 
 ## First-time setup (fresh clone, new machine)
+
+**Recommended: run `./setup.sh`.** It automates every step below —
+`.env` creation, token generation, the Linux uid-1000 permission fix, base
+onboarding, Claude CLI install, and wiring up the `claude-cli` runtime — and
+is safe to re-run (each step checks whether it's already done). The one
+thing it can't automate is the Claude CLI login itself (browser OAuth): it
+pauses, prints the exact command to run in another terminal, and waits for
+you to press Enter once you're logged in.
+
+```bash
+git clone <this-repo-url> openclaw-deploy
+cd openclaw-deploy
+./setup.sh
+```
+
+It ends by running the same `executionTrace.winnerProvider == "claude-cli"`
+verification described below, so a clean exit means the agent is actually
+working, not just configured.
+
+The manual steps it automates are documented below for transparency and for
+debugging if a step fails partway — `setup.sh` should always be kept in
+sync with this sequence; if you change one, change the other.
+
+### Manual steps (what `setup.sh` does under the hood)
 
 ```bash
 git clone <this-repo-url> openclaw-deploy
@@ -315,51 +340,37 @@ Since nothing is published, there's no `DOCKER-USER` iptables chain concern
 ### 3. Get the code onto the VPS
 ```bash
 git clone <this-repo-url> ~/openclaw-deploy
-```
-
-### 4. Set up `.env` and data
-```bash
 cd ~/openclaw-deploy
+```
+Optionally `scp`/`rsync` an existing `.env` and `.openclaw-data/` from
+another machine here if you want to carry over config/history instead of
+starting fresh — `setup.sh` (next step) detects an existing `openclaw.json`
+and skips re-onboarding.
+
+### 4. Run the setup script
+```bash
+./setup.sh
+```
+Same script as local first-time setup — see "First-time setup" above for
+what it does and why the login step still needs to be interactive. It
+handles `.env` creation, the Linux uid-1000 permission fix, base config,
+and Claude CLI install/wiring. **The manual steps it replaces are kept below
+for reference** if you need to debug a partial failure.
+
+<details>
+<summary>Manual steps (expand if setup.sh fails partway)</summary>
+
+```bash
 cp .env.example .env
 # edit .env: set OPENCLAW_GATEWAY_TOKEN, uncomment the deployment-override block
-```
-Or `scp`/`rsync` an existing `.env` and `.openclaw-data/` from another
-machine if you want to carry over config/history instead of starting fresh.
-
-If starting fresh, pre-create the data dirs with the right ownership before
-anything mounts them — the container runs as uid 1000, and on Linux (e.g.
-running as `root` on a fresh VPS) Docker will otherwise auto-create these
-owned by whoever ran `docker compose`, causing
-`EACCES: permission denied` inside the container:
-```bash
 mkdir -p .openclaw-data/config .openclaw-data/workspace .openclaw-data/auth-secrets
 sudo chown -R 1000:1000 .openclaw-data
-```
-
-### 5. Bring it up
-```bash
 docker compose pull openclaw-gateway
-```
-If you copied over an existing `.openclaw-data/` with a working
-`openclaw.json`, just start it:
-```bash
-docker compose up -d openclaw-gateway
-```
-If starting fresh, create the base config first — the gateway crash-loops
-until `openclaw.json` exists:
-```bash
 docker compose run --rm --no-deps --entrypoint node openclaw-gateway \
   dist/index.js onboard --mode local --no-install-daemon \
   --non-interactive --accept-risk --auth-choice skip \
   --gateway-bind loopback --skip-channels --skip-skills --skip-hooks --skip-search --skip-health
 docker compose up -d openclaw-gateway
-```
-
-### 6. Authenticate Claude CLI on the VPS
-(Required regardless of whether you copied `.openclaw-data/` — see the
-`openclaw_home` volume note above. This is interactive OAuth — run it
-yourself over your SSH session, not via automation.)
-```bash
 docker compose run --rm --entrypoint sh openclaw-cli -lc \
   'curl -fsSL https://claude.ai/install.sh | bash'
 docker compose run --rm -it --entrypoint sh openclaw-cli -lc \
@@ -369,8 +380,9 @@ docker compose run --rm openclaw-cli config set \
 ```
 Then wire up the agent runtime the same way as "First-time setup" above
 (the `onboard --auth-choice anthropic-cli` + model config commands).
+</details>
 
-### 7. Wire up Slack
+### 5. Wire up Slack
 Requires a Slack app with **Socket Mode** enabled — a bot token (`xoxb-...`)
 and an app-level token (`xapp-...`) from api.slack.com.
 ```bash
@@ -378,7 +390,7 @@ docker compose run --rm openclaw-cli channels add --channel slack \
   --bot-token "xoxb-..." --app-token "xapp-..."
 ```
 
-### 8. Terminal access, going forward
+### 6. Terminal access, going forward
 ```bash
 ssh vps-user@vps-host
 cd ~/openclaw-deploy && docker compose run --rm -it openclaw-cli chat
