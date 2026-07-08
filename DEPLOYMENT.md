@@ -539,10 +539,13 @@ is `true`) it skips the scaffold. It provisions:
 - the three enabling keys (below), and it verifies `echo-bot` responds before
   finishing.
 
-Then confirm dispatch (no Slack needed):
+Then confirm dispatch (no Slack needed). Use a **fresh `--session`** — existing
+sessions load their persona at creation, so one created before the scaffold (the
+setup verify's `main` session) won't have the coordinator instructions and will
+just answer directly:
 
 ```bash
-docker compose run --rm -it openclaw-cli chat
+docker compose run --rm -it openclaw-cli chat --session desk1
 #   › echo: banana
 #   › expect the reply to contain  ECHO-BOT>> banana   (main relayed it)
 ```
@@ -722,6 +725,15 @@ See `docs.openclaw.ai/tools/subagents`.
   model's judgment, phrase the request as an explicit spawn:
   `Use the sessions_spawn tool with agentId "echo-bot" to run: echo banana`,
   then check `/subagents list`.
+- **Coordinator just answers directly / echoes instead of delegating** — you're
+  likely in a session created *before* the coordinator persona was applied
+  (e.g. the `main` session from setup's verify step, recognizable by leftover
+  `SETUP_SCRIPT_OK` history). Sessions load their agent persona at creation.
+  Start a fresh one: `docker compose run --rm -it openclaw-cli chat --session
+  desk1`. If a brand-new session still won't relay, force the tool to isolate
+  the cause: `Use the sessions_send tool to send "banana" to agent "echo-bot",
+  wait for the reply, and return it` — a working result means it's persona
+  wording, not plumbing.
 - **This repo has no `Dockerfile` and no application source, on purpose** —
   don't `git clone` the full `openclaw/openclaw` project expecting to find
   more here; everything needed to run is in this repo (the two compose files

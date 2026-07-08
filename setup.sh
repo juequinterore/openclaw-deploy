@@ -213,7 +213,8 @@ JSON
     ER=$(docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
       --agent echo-bot --message "banana" --json --timeout 60)
     if [[ "$ER" == *'ECHO-BOT>>'* ]]; then
-      log "echo-bot OK. Test the coordinator: docker compose run --rm -it openclaw-cli chat  (then type: echo: banana)"
+      log "echo-bot OK. Test the coordinator in a FRESH session (existing ones predate the persona):"
+      log "  docker compose run --rm -it openclaw-cli chat --session desk1   (then type: echo: banana)"
     else
       fail "echo-bot did not respond as expected. Full output:
 $ER"
