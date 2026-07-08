@@ -534,12 +534,16 @@ two primitives):
 
 The config lives at `./.openclaw-data/config/openclaw.json` (bind-mounted). Aim
 for this shape — `main` is the coordinator, `coder`/`researcher` are persistent
-specialists with distinct capabilities:
+specialists with distinct capabilities. Note the exact nesting (verified against
+`openclaw config schema`): **`list` is a sibling of `defaults` under `agents`,
+and `bindings` is top-level** — `agents.defaults` is a closed object, so putting
+`list`/`bindings` inside it fails with `Unrecognized keys: "list", "bindings"`.
 
 ```json5
 {
   agents: {
-    list: [
+    defaults: { /* everything setup.sh created — leave as-is */ },
+    list: [                               // sibling of defaults, NOT inside it
       {
         id: "main",                       // coordinator / front door
         subagents: {
@@ -560,7 +564,8 @@ specialists with distinct capabilities:
       },
     ],
   },
-  bindings: [
+  },                                      // ← end of `agents`
+  bindings: [                             // TOP-LEVEL, sibling of `agents`
     { agentId: "main", match: { channel: "slack", accountId: "*" } },
   ],
 }
@@ -570,19 +575,35 @@ Per-agent personality/dispatch instructions go in each agent's workspace files
 (`SOUL.md` / `AGENTS.md`) — that's where you tell `main` *which* specialist
 handles what.
 
-**Applying it:** the exact mutation CLI varies by OpenClaw version — the docs
-reference both an `agents` subcommand and `config set ... --strict-json`, and
-don't pin down the per-item path for `agents.list[]`. Check what your image
-supports first, then use whichever is real:
+**Applying it — use `config patch`** (a validated recursive merge: objects
+merge, arrays replace, `null` deletes). It adds `agents.list` without clobbering
+the `defaults` block and validates before writing, so you can't half-apply a bad
+edit:
 
 ```bash
-docker compose run --rm openclaw-cli config --help          # see available verbs
-docker compose run --rm openclaw-cli agents --help 2>/dev/null || true
-# Either set the whole array as JSON (merge to avoid dropping `main`):
-docker compose run --rm openclaw-cli config set agents.list '<json-array>' --strict-json --merge
-# ...or edit ./.openclaw-data/config/openclaw.json directly, then:
+docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
+{
+  "agents": {
+    "list": [
+      { "id": "main", "subagents": { "allowAgents": ["coder","researcher"], "requireAgentId": false } },
+      { "id": "coder", "model": "anthropic/claude-opus-4-6",
+        "tools": { "allow": ["read","write","edit","exec"] } },
+      { "id": "researcher", "model": "anthropic/claude-sonnet-4-6",
+        "tools": { "allow": ["read","exec"], "deny": ["write","edit"] } }
+    ]
+  },
+  "bindings": [ { "agentId": "main", "match": { "channel": "slack", "accountId": "*" } } ]
+}
+JSON
+docker compose run --rm openclaw-cli config validate       # confirm schema-valid
 docker compose restart openclaw-gateway
 ```
+
+Note: `config patch` *replaces* the whole `agents.list` array (arrays don't
+merge). Run `config get agents.list` first — if `main` already has fields, fold
+them into the patch. If you hand-edit `openclaw.json` instead, always finish
+with `config validate` before restarting: a bad edit makes the gateway log
+`config reload skipped (invalid config)` and keep the previous config.
 
 Keep any per-agent `workspace:` paths under `/home/node/.openclaw` so they land
 in the bind-mounted data dir and survive restarts.
@@ -621,19 +642,22 @@ answer returns to the requester conversation.
 If you don't have real specialists designed yet, drop in a trivial one whose
 replies are unmistakable, so you can confirm dispatch end-to-end in minutes.
 
-1. Add `echo-bot` alongside `main`. Either merge this into
-   `./.openclaw-data/config/openclaw.json` or apply with `config set` (confirm
-   the syntax first, per the note above):
-   ```json5
+1. Add `echo-bot` alongside `main` with `config patch` (validated merge — keeps
+   `agents.defaults` intact; `list` stays a sibling of `defaults`, `bindings`
+   stays top-level):
+   ```bash
+   docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
    {
-     agents: {
-       list: [
-         { id: "main", subagents: { allowAgents: ["echo-bot"], requireAgentId: false } },
-         { id: "echo-bot", workspace: "/home/node/.openclaw/agents/echo-bot/workspace" },
-       ],
+     "agents": {
+       "list": [
+         { "id": "main", "subagents": { "allowAgents": ["echo-bot"], "requireAgentId": false } },
+         { "id": "echo-bot", "workspace": "/home/node/.openclaw/agents/echo-bot/workspace" }
+       ]
      },
-     bindings: [ { agentId: "main", match: { channel: "slack", accountId: "*" } } ],
+     "bindings": [ { "agentId": "main", "match": { "channel": "slack", "accountId": "*" } } ]
    }
+   JSON
+   docker compose run --rm openclaw-cli config validate
    ```
 
 2. Give `echo-bot` a one-line persona that makes its output a sentinel. Write it
@@ -738,6 +762,14 @@ documented, and needs no coordinator or subagents.
   publishing can't bridge that gap. Docker's internal healthcheck still
   works fine (it runs inside the container), and `openclaw-cli` still works
   (it shares the same network namespace).
+- **`config reload skipped (invalid config): agents.defaults: Unrecognized
+  keys: "list", "bindings"`** — a multi-agent edit put `list`/`bindings` inside
+  `agents.defaults`, which is a closed object. `agents.list` is a sibling of
+  `agents.defaults`, and `bindings` is a top-level key. The gateway kept the
+  previous valid config (nothing broke). Move the keys to the right level (see
+  "Single point of contact → persistent specialists"), or apply via `config
+  patch`, then `config validate` before restarting. Inspect the real schema any
+  time with `docker compose run --rm openclaw-cli config schema`.
 - **This repo has no `Dockerfile` and no application source, on purpose** —
   don't `git clone` the full `openclaw/openclaw` project expecting to find
   more here; everything needed to run is in this repo (the two compose files
