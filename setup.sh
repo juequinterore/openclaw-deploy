@@ -92,8 +92,16 @@ docker compose run --rm --entrypoint sh openclaw-cli -lc \
 
 # --- 6. Interactive login — cannot be scripted ----------------------------
 claude_logged_in() {
-  docker compose run --rm --entrypoint sh openclaw-cli -lc \
-    '/home/node/.local/bin/claude auth status' 2>/dev/null | grep -q '"loggedIn": *true'
+  # Deliberately not a `docker compose run ... | grep -q ...` pipe: grep -q
+  # exits the instant it finds a match, closing its end of the pipe early;
+  # docker compose run then hits a broken-pipe write and itself exits
+  # non-zero, which `pipefail` reports as the pipeline's exit status even
+  # though the underlying command actually succeeded. Capture to a variable
+  # first (a pipeless read to EOF) and pattern-match in pure bash instead.
+  local status_json
+  status_json=$(docker compose run --rm --entrypoint sh openclaw-cli -lc \
+    '/home/node/.local/bin/claude auth status' 2>/dev/null)
+  [[ "$status_json" == *'"loggedIn": true'* ]]
 }
 
 if claude_logged_in; then
@@ -133,7 +141,7 @@ log "Running end-to-end verification"
 RESULT=$(docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
   --agent main --message "Reply with exactly: SETUP_SCRIPT_OK" --json --timeout 60)
 
-if echo "$RESULT" | grep -q '"winnerProvider": *"claude-cli"' && echo "$RESULT" | grep -q 'SETUP_SCRIPT_OK'; then
+if [[ "$RESULT" == *'"winnerProvider": "claude-cli"'* && "$RESULT" == *'SETUP_SCRIPT_OK'* ]]; then
   log "SUCCESS — agent responded correctly via claude-cli."
 else
   fail "Verification failed. Full output:
