@@ -546,6 +546,10 @@ and `bindings` is top-level** — `agents.defaults` is a closed object, so putti
     list: [                               // sibling of defaults, NOT inside it
       {
         id: "main",                       // coordinator / front door
+        tools: { profile: "full" },       // REQUIRED: sessions_spawn is only in
+                                          // the "coding"/"full" profiles; a
+                                          // messaging-profile coordinator has no
+                                          // spawn tool and silently can't delegate
         subagents: {
           delegationMode: "prefer",       // REQUIRED nudge — without it `main` never delegates
           allowAgents: ["coder", "researcher"],  // who it may dispatch to
@@ -576,14 +580,21 @@ Per-agent personality/dispatch instructions go in each agent's workspace files
 (`SOUL.md` / `AGENTS.md`) — that's where you tell `main` *which* specialist
 handles what.
 
-**The coordinator must be told to delegate — two things, both required:**
-`delegationMode` is *prompt-only* (values `suggest`/`prefer`); it nudges but
-doesn't force. And `allowAgents` alone does nothing without it. If you set only
-`allowAgents`, `main` won't delegate — it treats the specialist as a session to
-"look up," fails to find one, and answers on its own. So: set
-`delegationMode: "prefer"` **and** give `main` an explicit instruction in its
-workspace, e.g. *"to echo text, spawn a subagent with agentId `echo-bot` via the
-sessions_spawn tool and return its reply."*
+**The coordinator needs three things — all required; miss any one and it won't
+delegate:**
+1. **A tool profile that includes `sessions_spawn`.** `tools.profile` is one of
+   `minimal | coding | messaging | full`, and `sessions_spawn` is tagged for
+   the `coding` profile only (or `full`, which is a `["*"]` wildcard). A
+   coordinator left on the default/messaging profile simply *has no spawn tool*
+   — in the TUI it will list `sessions_list/history/yield` but not
+   `sessions_spawn`, and it'll try to "find a session" and give up. Use `full`
+   so the coordinator keeps its messaging tools too (`coding` drops most of
+   them, so the coordinator couldn't reply on channels).
+2. **`delegationMode`** — prompt-only (`suggest`/`prefer`), no default. Nudges
+   the model to delegate; `allowAgents` alone does nothing without it.
+3. **An explicit instruction** in `main`'s workspace (`AGENTS.md`), e.g. *"to
+   echo text, spawn a subagent with agentId `echo-bot` via the sessions_spawn
+   tool and return its reply."*
 
 **Applying it — use `config patch`** (a validated recursive merge: objects
 merge, arrays replace, `null` deletes). It adds `agents.list` without clobbering
@@ -595,7 +606,7 @@ docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
 {
   "agents": {
     "list": [
-      { "id": "main", "subagents": { "delegationMode": "prefer", "allowAgents": ["coder","researcher"], "requireAgentId": false } },
+      { "id": "main", "tools": { "profile": "full" }, "subagents": { "delegationMode": "prefer", "allowAgents": ["coder","researcher"], "requireAgentId": false } },
       { "id": "coder", "model": "anthropic/claude-opus-4-6",
         "tools": { "allow": ["read","write","edit","exec"] } },
       { "id": "researcher", "model": "anthropic/claude-sonnet-4-6",
@@ -660,7 +671,7 @@ replies are unmistakable, so you can confirm dispatch end-to-end in minutes.
    {
      "agents": {
        "list": [
-         { "id": "main", "subagents": { "delegationMode": "prefer", "allowAgents": ["echo-bot"], "requireAgentId": false } },
+         { "id": "main", "tools": { "profile": "full" }, "subagents": { "delegationMode": "prefer", "allowAgents": ["echo-bot"], "requireAgentId": false } },
          { "id": "echo-bot", "workspace": "/home/node/.openclaw/agents/echo-bot/workspace" }
        ]
      },
@@ -785,13 +796,19 @@ documented, and needs no coordinator or subagents.
   "Single point of contact → persistent specialists"), or apply via `config
   patch`, then `config validate` before restarting. Inspect the real schema any
   time with `docker compose run --rm openclaw-cli config schema`.
+- **Coordinator says `sessions_spawn` isn't available (only `sessions_list` /
+  `sessions_history` / `sessions_yield`)** — its tool profile doesn't include
+  the spawn tool. `sessions_spawn` is in the `coding`/`full` profiles only; a
+  messaging/default-profile agent never gets it. Set
+  `agents.list[main].tools.profile: "full"` and restart. Verify inside the TUI
+  that `sessions_spawn` now appears before debugging anything else.
 - **Coordinator won't delegate — it says it "can't find the echo-bot session"
-  / can only see its own scope** — the coordinator has `allowAgents` but no
-  `delegationMode`, so it got no delegation guidance and doesn't know it can
-  spawn. Set `agents.list[main].subagents.delegationMode: "prefer"` **and** put
-  an explicit instruction in `main`'s workspace `AGENTS.md` ("spawn agentId
-  `echo-bot` via sessions_spawn for echo requests"). To test the plumbing
-  independent of the model's judgment, phrase the request as an explicit spawn:
+  / can only see its own scope** — *after* the profile fix above, this is the
+  delegation gap: `allowAgents` without `delegationMode` gives no guidance. Set
+  `agents.list[main].subagents.delegationMode: "prefer"` **and** put an explicit
+  instruction in `main`'s workspace `AGENTS.md` ("spawn agentId `echo-bot` via
+  sessions_spawn for echo requests"). To test the plumbing independent of the
+  model's judgment, phrase the request as an explicit spawn:
   `Use the sessions_spawn tool with agentId "echo-bot" to run: echo banana`,
   then check `/subagents list`.
 - **This repo has no `Dockerfile` and no application source, on purpose** —
