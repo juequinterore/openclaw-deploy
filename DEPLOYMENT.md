@@ -547,6 +547,7 @@ and `bindings` is top-level** — `agents.defaults` is a closed object, so putti
       {
         id: "main",                       // coordinator / front door
         subagents: {
+          delegationMode: "prefer",       // REQUIRED nudge — without it `main` never delegates
           allowAgents: ["coder", "researcher"],  // who it may dispatch to
           requireAgentId: false,
           maxConcurrent: 4,               // concurrent claude processes — size the VPS
@@ -575,6 +576,15 @@ Per-agent personality/dispatch instructions go in each agent's workspace files
 (`SOUL.md` / `AGENTS.md`) — that's where you tell `main` *which* specialist
 handles what.
 
+**The coordinator must be told to delegate — two things, both required:**
+`delegationMode` is *prompt-only* (values `suggest`/`prefer`); it nudges but
+doesn't force. And `allowAgents` alone does nothing without it. If you set only
+`allowAgents`, `main` won't delegate — it treats the specialist as a session to
+"look up," fails to find one, and answers on its own. So: set
+`delegationMode: "prefer"` **and** give `main` an explicit instruction in its
+workspace, e.g. *"to echo text, spawn a subagent with agentId `echo-bot` via the
+sessions_spawn tool and return its reply."*
+
 **Applying it — use `config patch`** (a validated recursive merge: objects
 merge, arrays replace, `null` deletes). It adds `agents.list` without clobbering
 the `defaults` block and validates before writing, so you can't half-apply a bad
@@ -585,7 +595,7 @@ docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
 {
   "agents": {
     "list": [
-      { "id": "main", "subagents": { "allowAgents": ["coder","researcher"], "requireAgentId": false } },
+      { "id": "main", "subagents": { "delegationMode": "prefer", "allowAgents": ["coder","researcher"], "requireAgentId": false } },
       { "id": "coder", "model": "anthropic/claude-opus-4-6",
         "tools": { "allow": ["read","write","edit","exec"] } },
       { "id": "researcher", "model": "anthropic/claude-sonnet-4-6",
@@ -650,7 +660,7 @@ replies are unmistakable, so you can confirm dispatch end-to-end in minutes.
    {
      "agents": {
        "list": [
-         { "id": "main", "subagents": { "allowAgents": ["echo-bot"], "requireAgentId": false } },
+         { "id": "main", "subagents": { "delegationMode": "prefer", "allowAgents": ["echo-bot"], "requireAgentId": false } },
          { "id": "echo-bot", "workspace": "/home/node/.openclaw/agents/echo-bot/workspace" }
        ]
      },
@@ -678,12 +688,17 @@ replies are unmistakable, so you can confirm dispatch end-to-end in minutes.
    docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
      --agent echo-bot --message "banana" --json --timeout 60
 
-   # (b) dispatch through the coordinator — interactive
+   # (b) dispatch through the coordinator — interactive. Phrase it as an
+   #     EXPLICIT spawn so you test the plumbing, not the model's judgment
+   #     (delegationMode only nudges; a vague "ask the echo-bot specialist"
+   #      often makes `main` hunt for a session and give up):
    docker compose run --rm -it openclaw-cli chat
-   #   › "ask the echo-bot specialist to echo: banana"   (explicit — tests plumbing)
+   #   › Use the sessions_spawn tool with agentId "echo-bot" to run: echo banana
    #   › expect a reply containing  ECHO-BOT>> banana
    #   › /subagents list     → confirm a child ran with agent id "echo-bot"
    #   › /subagents info <id> → confirm its resolved agent/model
+   # Once that works, add a line to main's workspace AGENTS.md telling it to
+   # delegate echo requests to echo-bot, and natural phrasing will route too.
    ```
 
 4. Tear it down when done: remove the `echo-bot` entry from `agents.list` (and
@@ -770,6 +785,15 @@ documented, and needs no coordinator or subagents.
   "Single point of contact → persistent specialists"), or apply via `config
   patch`, then `config validate` before restarting. Inspect the real schema any
   time with `docker compose run --rm openclaw-cli config schema`.
+- **Coordinator won't delegate — it says it "can't find the echo-bot session"
+  / can only see its own scope** — the coordinator has `allowAgents` but no
+  `delegationMode`, so it got no delegation guidance and doesn't know it can
+  spawn. Set `agents.list[main].subagents.delegationMode: "prefer"` **and** put
+  an explicit instruction in `main`'s workspace `AGENTS.md` ("spawn agentId
+  `echo-bot` via sessions_spawn for echo requests"). To test the plumbing
+  independent of the model's judgment, phrase the request as an explicit spawn:
+  `Use the sessions_spawn tool with agentId "echo-bot" to run: echo banana`,
+  then check `/subagents list`.
 - **This repo has no `Dockerfile` and no application source, on purpose** —
   don't `git clone` the full `openclaw/openclaw` project expecting to find
   more here; everything needed to run is in this repo (the two compose files
