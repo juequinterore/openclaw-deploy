@@ -13,6 +13,18 @@ cd "$SCRIPT_DIR"
 log()  { printf '\n\033[1;36m==>\033[0m %s\n' "$1"; }
 fail() { printf '\033[1;31mERROR:\033[0m %s\n' "$1" >&2; exit 1; }
 
+# --- args ---------------------------------------------------------------
+WITH_AGENTS=0
+for arg in "$@"; do
+  case "$arg" in
+    --agents|--with-agents) WITH_AGENTS=1 ;;
+    -h|--help)
+      printf 'Usage: ./setup.sh [--agents]\n\n  --agents  After the base setup, scaffold a coordinator (main) plus a\n            persistent echo-bot specialist wired for cross-agent messaging\n            (sessions_send + tools.agentToAgent). Idempotent; skips if agents\n            are already configured. See "Single point of contact" in\n            DEPLOYMENT.md.\n'
+      exit 0 ;;
+    *) fail "Unknown argument: $arg (try --help)" ;;
+  esac
+done
+
 command -v docker >/dev/null 2>&1 || fail "docker not found. Install Docker first."
 docker compose version >/dev/null 2>&1 || fail "docker compose v2 not found."
 
@@ -156,6 +168,54 @@ if [[ "$RESULT" == *'"winnerProvider": "claude-cli"'* && "$RESULT" == *'SETUP_SC
 else
   fail "Verification failed. Full output:
 $RESULT"
+fi
+
+# --- 9. Optional: scaffold the multi-agent coordinator (--agents) ---------
+if [[ "$WITH_AGENTS" -eq 1 ]]; then
+  log "Scaffolding multi-agent coordinator (--agents)"
+  ALREADY=$(docker compose run --rm openclaw-cli config get tools.agentToAgent.enabled 2>/dev/null | tr -d '[:space:]')
+  if [[ "$ALREADY" == "true" ]]; then
+    log "Agents already configured (tools.agentToAgent.enabled=true) — skipping scaffold"
+  else
+    log "Applying coordinator + echo-bot config"
+    docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
+{
+  "agents": { "list": [
+    { "id": "main", "default": true, "tools": { "profile": "messaging" },
+      "workspace": "/home/node/.openclaw/workspace" },
+    { "id": "echo-bot", "tools": { "profile": "messaging" },
+      "workspace": "/home/node/.openclaw/agents/echo-bot/workspace" }
+  ] },
+  "tools": {
+    "sessions": { "visibility": "all" },
+    "agentToAgent": { "enabled": true, "allow": ["*"] }
+  },
+  "session": { "agentToAgent": { "maxPingPongTurns": 2 } }
+}
+JSON
+    log "Writing coordinator + echo-bot personas (owned by uid 1000)"
+    docker compose run --rm --entrypoint sh openclaw-cli -lc '
+      m=/home/node/.openclaw/workspace; mkdir -p "$m";
+      printf "%s\n" "# Front desk (coordinator)" \
+        "Route requests to specialist agents with the sessions_send tool: send the request to the right agent, wait for its reply, then relay that reply to the user." \
+        "For any request to echo text, send it to agent \"echo-bot\" and return its reply verbatim." > "$m/AGENTS.md";
+      e=/home/node/.openclaw/agents/echo-bot/workspace; mkdir -p "$e";
+      printf "%s\n" "# echo-bot" \
+        "You are a test specialist. Reply to EVERY message with exactly:" \
+        "ECHO-BOT>> <repeat the user message verbatim>" > "$e/AGENTS.md" '
+    docker compose run --rm openclaw-cli config validate
+    docker compose restart openclaw-gateway
+    sleep 5
+    log "Verifying the echo-bot specialist responds"
+    ER=$(docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
+      --agent echo-bot --message "banana" --json --timeout 60)
+    if [[ "$ER" == *'ECHO-BOT>>'* ]]; then
+      log "echo-bot OK. Test the coordinator: docker compose run --rm -it openclaw-cli chat  (then type: echo: banana)"
+    else
+      fail "echo-bot did not respond as expected. Full output:
+$ER"
+    fi
+  fi
 fi
 
 log "Done. Try: docker compose run --rm -it openclaw-cli chat"

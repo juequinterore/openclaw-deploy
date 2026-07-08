@@ -10,11 +10,11 @@ This is a companion to `docs.openclaw.ai`, not a replacement — it only
 covers decisions and config specific to this instance.
 
 It also doubles as a **template**: one deployment runs one agent, and you copy
-it once per agent — on the same VPS or on separate VPSs. See "Running multiple
-agents on one host" and "Enabling subagents" below. (For a single agent that
-transparently fans work out to specialists behind one Slack channel, you want
-subagents — a config feature of a *single* deployment — not multiple
-deployments.)
+it once per agent — on the same VPS or on separate VPSs (see "Running multiple
+agents on one host"). For a single agent that transparently routes to persistent
+specialists behind one Slack channel, see "Single point of contact → persistent
+specialists" — that's a config feature of a *single* deployment (try
+`./setup.sh --agents`), not multiple deployments.
 
 ## Repo structure
 
@@ -467,288 +467,199 @@ cd ../openclaw-sales  && ./setup.sh
   `docker compose config | grep -E 'name:|container_name'` in each directory
   should show distinct volume/container names.
 
-## Enabling subagents (optional)
+## Subagents: stateless parallel fan-out (optional)
 
-If instead you want **one** agent that transparently delegates to specialists
-behind a **single** Slack channel, that's OpenClaw *subagents* — a config
-feature of a single deployment, not multiple deployments. Everything stays in
-one gateway, one container, one Slack app, and **one Claude CLI login** (child
-runs inherit the parent's auth), so no infrastructure changes are needed — the
-setup in this repo already supports it. Turn it on with config:
+Subagents are a *different* mechanism from the coordinator pattern below: a
+running agent spawns **ephemeral background runs** with `sessions_spawn` to
+parallelize discrete tasks. Use them for stateless fan-out (e.g. "review these
+five files at once"), **not** for a persistent front desk — for "one Slack
+contact routing to persistent specialists" use the relay pattern in "Single
+point of contact → persistent specialists" below (it keeps specialist memory
+and needs no elevated tool profile).
+
+Enable it on the agent that will spawn. Note `sessions_spawn` requires the
+`coding` or `full` tool profile — a `messaging`-profile agent has no spawn tool:
 
 ```bash
-docker compose run --rm openclaw-cli config set agents.defaults.subagents.delegationMode prefer
-# optional: run children on a cheaper model than the parent
-docker compose run --rm openclaw-cli config set agents.defaults.subagents.model anthropic/claude-haiku-4-5
-# concurrency safety valve (default 8) — see sizing note below
-docker compose run --rm openclaw-cli config set agents.defaults.subagents.maxConcurrent 8
+docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
+{ "agents": { "list": [ { "id": "main", "tools": { "profile": "full" },
+  "subagents": { "delegationMode": "prefer", "allowAgents": ["*"],
+                 "model": "anthropic/claude-haiku-4-5", "maxConcurrent": 8 } } ] } }
+JSON
 docker compose restart openclaw-gateway
 ```
 
-The parent agent decides when to spawn a subagent (via the `sessions_spawn`
-tool) and synthesizes the result back into the same Slack channel, so the user
-talks to one bot and doesn't need to know specialists exist. See
-`docs.openclaw.ai/tools/subagents` for the full field list
-(`agents.defaults.subagents.*`, `tools.subagents.tools.{allow,deny}`,
-per-agent `agents.list[].subagents.*`).
-
-Two things to keep in mind:
+Keep in mind:
 
 - **Sizing.** Subagents are concurrent `claude` CLI processes inside the one
-  container (up to `maxConcurrent`), each with its own context and token spend.
-  A subagent-heavy deployment wants a larger VPS and will cost more per request
-  than a single-agent one — pointing children at a cheaper model helps.
-- **Optional sandboxing.** If you want subagents to run sandboxed
-  (`sandbox: require`), that needs the Docker CLI + socket — uncomment the
-  `/var/run/docker.sock` mount and `group_add`/`DOCKER_GID` block in
-  `docker-compose.yml` (kept commented by default). Not required for the
-  default (logical session isolation).
-- **Routing caveat.** Delegation is decided by the parent model, not by fixed
-  rules; for "requests of type X always go to specialist Y" you shape it via
-  prompt/config. Persistent thread-binding of follow-ups to a specific subagent
-  is documented for Discord/Matrix/Telegram/iMessage — confirm current Slack
-  behavior in the upstream docs before relying on it for Slack threads.
+  container (up to `maxConcurrent`), each with its own context and token spend —
+  a subagent-heavy deployment wants a larger VPS; a cheaper child `model` helps.
+- **Optional sandboxing.** For sandboxed children (`sandbox: require`), uncomment
+  the `/var/run/docker.sock` mount and `group_add`/`DOCKER_GID` block in
+  `docker-compose.yml`. Not needed for the default (logical session isolation).
+- **Slack caveat.** Announce-back to the requester conversation works, but
+  persistent thread-binding of follow-ups to a specific subagent is
+  Discord/iMessage/Matrix/Telegram only — on Slack the parent re-dispatches each
+  turn. See `docs.openclaw.ai/tools/subagents`.
 
 ## Single point of contact → persistent specialists (coordinator pattern)
 
-Goal: one Slack channel (or one TUI session) where a user talks to a single
-agent, and that agent decides — by the *content* of the request — which
-specialist handles it, transparently. Unlike bare subagents (ephemeral runs),
-here each specialist is a **persistent agent definition** with its own model,
-tools, skills, and workspace; unlike separate deployments, they all live in
-**one gateway sharing one Claude CLI login**, so this is still a single
-deployment of this template — no infra change.
+Goal: one Slack channel (or TUI session) where the user talks to a single "front
+desk" agent that routes each request to the right specialist — transparently,
+with specialists keeping their own memory across turns. This is a **single
+deployment** of this template: every agent runs in one gateway, shares one
+Claude CLI login, and adds no infrastructure.
 
-**How it composes** (OpenClaw has no turnkey "coordinator", so you build it from
-two primitives):
-- The existing `main` agent is the **coordinator** — the default binding for the
-  channel, so every inbound message lands on it.
-- **Specialists** are extra entries in `agents.list[]`, each with its own
-  capabilities.
-- The coordinator dispatches with the subagents `sessions_spawn` tool using the
-  `agentId` parameter, which runs the child **as** a chosen specialist
-  (inheriting that specialist's model/tools/workspace). The child's result
-  announces back to the requester conversation.
+**The mechanism (what actually works on Slack):** the coordinator relays via
+**cross-agent messaging**, not subagent spawning. It calls `sessions_send` to
+hand the request to a specialist's own session (waiting for the reply), then
+relays that reply to the user in its normal channel message. Because the
+coordinator owns the outbound reply, this is channel-agnostic — no Slack
+thread-binding caveats. And `sessions_send` is in the **`messaging`** tool
+profile, so the coordinator needs no elevated profile (unlike `sessions_spawn`,
+which is `coding`/`full` only — see the note near the end).
 
-### Target `openclaw.json`
+### Quickest path: `./setup.sh --agents`
 
-The config lives at `./.openclaw-data/config/openclaw.json` (bind-mounted). Aim
-for this shape — `main` is the coordinator, `coder`/`researcher` are persistent
-specialists with distinct capabilities. Note the exact nesting (verified against
-`openclaw config schema`): **`list` is a sibling of `defaults` under `agents`,
-and `bindings` is top-level** — `agents.defaults` is a closed object, so putting
-`list`/`bindings` inside it fails with `Unrecognized keys: "list", "bindings"`.
+Re-run setup with the flag to scaffold a working coordinator plus a throwaway
+`echo-bot` specialist, wired with the enabling keys:
+
+```bash
+./setup.sh --agents
+```
+
+It's idempotent — if agents are already configured (`tools.agentToAgent.enabled`
+is `true`) it skips the scaffold. It provisions:
+
+- **`main`** — the coordinator: `default: true` (front door for unrouted
+  messages), `messaging` profile, with an `AGENTS.md` telling it to relay echo
+  requests to `echo-bot` via `sessions_send`.
+- **`echo-bot`** — a persistent specialist whose replies start with the sentinel
+  `ECHO-BOT>>`.
+- the three enabling keys (below), and it verifies `echo-bot` responds before
+  finishing.
+
+Then confirm dispatch (no Slack needed):
+
+```bash
+docker compose run --rm -it openclaw-cli chat
+#   › echo: banana
+#   › expect the reply to contain  ECHO-BOT>> banana   (main relayed it)
+```
+
+### What gets configured (and why)
+
+The scaffold applies this via `config patch` (validated merge), using the
+container's mounted paths:
 
 ```json5
 {
   agents: {
-    defaults: { /* everything setup.sh created — leave as-is */ },
-    list: [                               // sibling of defaults, NOT inside it
-      {
-        id: "main",                       // coordinator / front door
-        tools: { profile: "full" },       // REQUIRED: sessions_spawn is only in
-                                          // the "coding"/"full" profiles; a
-                                          // messaging-profile coordinator has no
-                                          // spawn tool and silently can't delegate
-        subagents: {
-          delegationMode: "prefer",       // REQUIRED nudge — without it `main` never delegates
-          allowAgents: ["coder", "researcher"],  // who it may dispatch to
-          requireAgentId: false,
-          maxConcurrent: 4,               // concurrent claude processes — size the VPS
-        },
-      },
-      {
-        id: "coder",
-        model: "anthropic/claude-opus-4-6",
-        tools: { allow: ["read", "write", "edit", "exec"] },
-      },
-      {
-        id: "researcher",
-        model: "anthropic/claude-sonnet-4-6",
-        tools: { allow: ["read", "exec"], deny: ["write", "edit"] },
-      },
-    ],
-  },
-  },                                      // ← end of `agents`
-  bindings: [                             // TOP-LEVEL, sibling of `agents`
-    { agentId: "main", match: { channel: "slack", accountId: "*" } },
-  ],
-}
-```
-
-Per-agent personality/dispatch instructions go in each agent's workspace files
-(`SOUL.md` / `AGENTS.md`) — that's where you tell `main` *which* specialist
-handles what.
-
-**The coordinator needs three things — all required; miss any one and it won't
-delegate:**
-1. **A tool profile that includes `sessions_spawn`.** `tools.profile` is one of
-   `minimal | coding | messaging | full`, and `sessions_spawn` is tagged for
-   the `coding` profile only (or `full`, which is a `["*"]` wildcard). A
-   coordinator left on the default/messaging profile simply *has no spawn tool*
-   — in the TUI it will list `sessions_list/history/yield` but not
-   `sessions_spawn`, and it'll try to "find a session" and give up. Use `full`
-   so the coordinator keeps its messaging tools too (`coding` drops most of
-   them, so the coordinator couldn't reply on channels).
-2. **`delegationMode`** — prompt-only (`suggest`/`prefer`), no default. Nudges
-   the model to delegate; `allowAgents` alone does nothing without it.
-3. **An explicit instruction** in `main`'s workspace (`AGENTS.md`), e.g. *"to
-   echo text, spawn a subagent with agentId `echo-bot` via the sessions_spawn
-   tool and return its reply."*
-
-**Applying it — use `config patch`** (a validated recursive merge: objects
-merge, arrays replace, `null` deletes). It adds `agents.list` without clobbering
-the `defaults` block and validates before writing, so you can't half-apply a bad
-edit:
-
-```bash
-docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
-{
-  "agents": {
-    "list": [
-      { "id": "main", "tools": { "profile": "full" }, "subagents": { "delegationMode": "prefer", "allowAgents": ["coder","researcher"], "requireAgentId": false } },
-      { "id": "coder", "model": "anthropic/claude-opus-4-6",
-        "tools": { "allow": ["read","write","edit","exec"] } },
-      { "id": "researcher", "model": "anthropic/claude-sonnet-4-6",
-        "tools": { "allow": ["read","exec"], "deny": ["write","edit"] } }
+    defaults: { /* model + claude-cli runtime from setup.sh — leave as-is */ },
+    list: [
+      { id: "main", default: true,           // front door: unrouted messages land here
+        tools: { profile: "messaging" },      // has sessions_send; minimal privilege
+        workspace: "/home/node/.openclaw/workspace" },
+      { id: "echo-bot",                        // a persistent specialist (own session/memory)
+        tools: { profile: "messaging" },       // specialists that touch files/exec use "coding"
+        workspace: "/home/node/.openclaw/agents/echo-bot/workspace" }
     ]
   },
-  "bindings": [ { "agentId": "main", "match": { "channel": "slack", "accountId": "*" } } ]
+  tools: {
+    sessions:     { visibility: "all" },       // let main see/target other agents' sessions
+    agentToAgent: { enabled: true, allow: ["*"] } // permit cross-agent calls; scope `allow` to tighten
+  },
+  session: { agentToAgent: { maxPingPongTurns: 2 } } // reply-back turns (0-20; 0 = single exchange)
 }
-JSON
-docker compose run --rm openclaw-cli config validate       # confirm schema-valid
-docker compose restart openclaw-gateway
 ```
 
-Note: `config patch` *replaces* the whole `agents.list` array (arrays don't
-merge). Run `config get agents.list` first — if `main` already has fields, fold
-them into the patch. If you hand-edit `openclaw.json` instead, always finish
-with `config validate` before restarting: a bad edit makes the gateway log
-`config reload skipped (invalid config)` and keep the previous config.
+The three enabling keys, verified against `openclaw config schema`:
 
-Keep any per-agent `workspace:` paths under `/home/node/.openclaw` so they land
-in the bind-mounted data dir and survive restarts.
+- **`tools.sessions.visibility: "all"`** — scope for `sessions_list/history/send`
+  (`self` < `tree` (default) < `agent` < `all`). `all` lets the coordinator
+  target other agents' sessions.
+- **`tools.agentToAgent.enabled: true` + `allow: ["*"]`** — permits an agent to
+  invoke another at runtime; `allow` is the target allowlist (use explicit ids
+  to tighten).
+- **`session.agentToAgent.maxPingPongTurns`** — after the specialist replies, how
+  many reply-back turns the two agents may alternate (0–20, default 5). `0` =
+  one exchange, no follow-up loop.
 
-### Smoke test in the TUI (no Slack needed)
+Routing is **prompt-driven**: the coordinator's `AGENTS.md` says which specialist
+handles what and to reach it with `sessions_send` (wait mode). The keys grant the
+capability; the persona makes the call.
 
-You do **not** need Slack to validate the dispatch logic — the local TUI is a
-requester channel too, and it gives more visibility than Slack would. Test in
-three steps:
+### How the round-trip works
 
-```bash
-# 1. Each specialist runs with ITS OWN capabilities (non-interactive, inspectable).
-#    Check resolvedModel / executionTrace in the JSON — coder should be on opus.
-docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
-  --agent coder --message "what model are you and can you write files?" --json --timeout 60
-docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
-  --agent researcher --message "ping" --json --timeout 60
+1. The user messages the coordinator (the `default` agent) on Slack or in the TUI.
+2. The coordinator picks a specialist and calls `sessions_send(agentId, request,
+   <wait timeout>)`.
+3. The specialist runs in **its own persistent session** (keeps memory across
+   calls) and returns its answer inline to the coordinator.
+4. The coordinator relays that answer to the user in its own channel reply — the
+   user sees one bot.
 
-# 2. Coordinator dispatch — interactive, because spawn is async (a one-shot
-#    `agent` call can return before the child announces; the TUI lets you watch).
-docker compose run --rm -it openclaw-cli chat        # talks to `main` (coordinator)
-#   › ask something that should route to a specialist, e.g.
-#     "refactor this Python function ..."  (should go to coder)
-#   › then inspect what actually happened:
-#       /subagents list          # shows the child run and which agent id it ran as
-#       /subagents log <id>       # the child transcript
-#       /subagents info <id>      # status + resolved model/provider
-```
+### Adding real specialists
 
-Step 1 proves each specialist's capabilities are live; step 2 proves the
-coordinator decides by content, dispatches to the right specialist, and the
-answer returns to the requester conversation.
-
-### Quickstart: a throwaway `echo-bot` to exercise the plumbing
-
-If you don't have real specialists designed yet, drop in a trivial one whose
-replies are unmistakable, so you can confirm dispatch end-to-end in minutes.
-
-1. Add `echo-bot` alongside `main` with `config patch` (validated merge — keeps
-   `agents.defaults` intact; `list` stays a sibling of `defaults`, `bindings`
-   stays top-level):
+1. Add an `agents.list[]` entry with its own `id`, an `identity.name`, a
+   `workspace` under `/home/node/.openclaw/...`, and a `tools.profile` (`coding`
+   if it needs files/exec, `messaging` if it only talks). Add its id to
+   `tools.agentToAgent.allow` unless you keep `["*"]`. `config patch` **replaces**
+   the whole `agents.list`, so include every agent you want to keep (check
+   `config get agents.list` first):
    ```bash
    docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
-   {
-     "agents": {
-       "list": [
-         { "id": "main", "tools": { "profile": "full" }, "subagents": { "delegationMode": "prefer", "allowAgents": ["echo-bot"], "requireAgentId": false } },
-         { "id": "echo-bot", "workspace": "/home/node/.openclaw/agents/echo-bot/workspace" }
-       ]
-     },
-     "bindings": [ { "agentId": "main", "match": { "channel": "slack", "accountId": "*" } } ]
-   }
+   { "agents": { "list": [
+     { "id": "main", "default": true, "tools": { "profile": "messaging" }, "workspace": "/home/node/.openclaw/workspace" },
+     { "id": "billing", "tools": { "profile": "coding" }, "identity": { "name": "Billing" },
+       "workspace": "/home/node/.openclaw/agents/billing/workspace" }
+   ] } }
    JSON
    docker compose run --rm openclaw-cli config validate
    ```
-
-2. Give `echo-bot` a one-line persona that makes its output a sentinel. Write it
-   *from inside the container* so it's owned by uid 1000 (avoids the Linux
-   permission gotcha):
+2. Write the specialist's persona (its job) and add the routing rule to the
+   coordinator's `AGENTS.md`, both from inside the container (uid 1000):
    ```bash
    docker compose run --rm --entrypoint sh openclaw-cli -lc '
-     d=/home/node/.openclaw/agents/echo-bot/workspace; mkdir -p "$d";
-     printf "%s\n" "# echo-bot" \
-       "You are a test specialist. Reply to EVERY message with exactly:" \
-       "ECHO-BOT>> <repeat the user message verbatim>" > "$d/AGENTS.md" '
+     d=/home/node/.openclaw/agents/billing/workspace; mkdir -p "$d";
+     printf "%s\n" "# Billing specialist" "You answer billing questions. Be concise." > "$d/AGENTS.md" '
    docker compose restart openclaw-gateway
    ```
 
-3. Verify. The sentinel `ECHO-BOT>>` only appears if the specialist actually ran:
-   ```bash
-   # (a) specialist directly — expect "ECHO-BOT>>" in the reply text
-   docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
-     --agent echo-bot --message "banana" --json --timeout 60
+### Prefer to route by identity instead of content?
 
-   # (b) dispatch through the coordinator — interactive. Phrase it as an
-   #     EXPLICIT spawn so you test the plumbing, not the model's judgment
-   #     (delegationMode only nudges; a vague "ask the echo-bot specialist"
-   #      often makes `main` hunt for a session and give up):
-   docker compose run --rm -it openclaw-cli chat
-   #   › Use the sessions_spawn tool with agentId "echo-bot" to run: echo banana
-   #   › expect a reply containing  ECHO-BOT>> banana
-   #   › /subagents list     → confirm a child ran with agent id "echo-bot"
-   #   › /subagents info <id> → confirm its resolved agent/model
-   # Once that works, add a line to main's workspace AGENTS.md telling it to
-   # delegate echo requests to echo-bot, and natural phrasing will route too.
-   ```
+If different Slack channels/workspaces/users should map to different agents
+(rather than one agent dispatching by content), skip the coordinator and use
+top-level `bindings` — fully deterministic. See
+`docs.openclaw.ai/channels/channel-routing` (the `team`/`channel`/`peer` tiers
+cover Slack).
 
-4. Tear it down when done: remove the `echo-bot` entry from `agents.list` (and
-   `allowAgents`), then:
-   ```bash
-   docker compose run --rm --entrypoint sh openclaw-cli -lc \
-     'rm -rf /home/node/.openclaw/agents/echo-bot'
-   docker compose restart openclaw-gateway
-   ```
+### Or spawn ephemeral runs instead (`sessions_spawn`)
 
-Seeing `ECHO-BOT>>` come back through the coordinator in step 3(b) — with
-`/subagents list` showing the `echo-bot` child — is the whole pattern working,
-proven without touching Slack.
+The alternative to the relay pattern is subagent spawning: the coordinator calls
+`sessions_spawn` with `agentId` to run a **fresh** instance of a specialist (no
+cross-call memory), whose result announces back to the requester conversation.
+Use it for stateless, one-off fan-out. Two things differ:
 
-### What the TUI test does and doesn't cover
+- the coordinator must be on the **`coding` or `full`** profile (`sessions_spawn`
+  isn't in `messaging`) — set `agents.list[main].tools.profile: "full"`, plus
+  `subagents: { delegationMode: "prefer", allowAgents: [...] }`; and
+- on Slack there's no persistent thread-binding (Discord/iMessage/Matrix/Telegram
+  only), so follow-ups re-dispatch.
 
-- ✅ **Covers the core risk** — coordinator content-based dispatch, specialists
-  running with their own model/tools, and results returning to the requester.
-- ❌ **Does not cover Slack-specific delivery.** Verified from the docs: Slack is
-  **not** among the channels with a conversation-binding adapter (Discord,
-  iMessage, Matrix, Telegram are), so on Slack a subagent cannot stay
-  thread-bound — follow-ups return to the coordinator, which re-dispatches, and
-  specialists don't retain per-thread memory across turns. The base
-  announce-back to the originating Slack conversation is documented, but the
-  exact delivery/fallback fields aren't — confirm those with one real Slack
-  message when you wire it up.
-- ⚠️ **Agent-to-agent messaging** (`tools.agentToAgent`) is an alternative
-  dispatch path where specialists keep persistent per-conversation memory, but
-  its return-path behavior (does the reply reach the original user?) is
-  **undocumented** — test it live before relying on it. The subagent `agentId`
-  path above is the better-documented default.
+See `docs.openclaw.ai/tools/subagents`.
 
-### When to skip the coordinator
+### Things to review
 
-If you can dispatch by *identity* instead of content — different Slack
-channels/workspaces/users to different agents — use plain `bindings` (see the
-precedence list under `docs.openclaw.ai/channels/channel-routing`; the
-`team`/`channel`/`peer` tiers cover Slack). It's fully deterministic, fully
-documented, and needs no coordinator or subagents.
+- **Routing quality** is only as good as the coordinator's `AGENTS.md` — be
+  explicit about which specialist owns which kind of request.
+- **Breadth:** `allow: ["*"]` and `visibility: "all"` are wide open — fine for a
+  single-operator box; scope `allow` to explicit ids for least privilege.
+- **`maxPingPongTurns: 0`** blocks a specialist from asking the coordinator a
+  clarifying follow-up; use 1–2 if specialists need to round-trip.
+- **Sizing:** each active agent is another concurrent `claude` process in the one
+  container — size the VPS, and point cheaper specialists at cheaper models
+  per-agent (`agents.list[].model`).
 
 ## Troubleshooting notes learned while setting this up
 
