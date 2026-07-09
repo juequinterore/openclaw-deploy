@@ -217,9 +217,9 @@ JSON
     docker compose run --rm --entrypoint sh openclaw-cli -lc '
       m=/home/node/.openclaw/workspace; mkdir -p "$m";
       printf "%s\n" "# Front desk (coordinator)" \
-        "You are a thin router. Delegate to standing specialist agents with the sessions_send tool; do not do specialist work yourself." \
+        "You are a thin router. Never do specialist work yourself." \
         "A specialist session key has the form agent:<id>:main." \
-        "To echo text, call sessions_send(key=\"agent:echo-bot:main\", message=\"<text to echo>\", timeoutMs=120000), then return the reply from echo-bot verbatim." > "$m/AGENTS.md";
+        "RULE: Any message beginning with \"echo:\" MUST be relayed to echo-bot. Call sessions_send(key=\"agent:echo-bot:main\", message=\"<text after echo:>\", timeoutMs=120000) and return the reply from echo-bot verbatim. Never echo it yourself, even one word." > "$m/AGENTS.md";
       e=/home/node/.openclaw/agents/echo-bot/workspace; mkdir -p "$e";
       printf "%s\n" "# echo-bot" \
         "You are a test specialist. Reply to EVERY message with exactly:" \

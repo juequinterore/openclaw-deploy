@@ -1,0 +1,12 @@
+services:
+  openclaw-gateway:
+    # Opt-in override to reach the Control UI / dashboard in a browser for local
+    # validation. Re-publishes the gateway port that docker-compose.extra.yml
+    # clears (`ports: !reset []`), bound to the HOST LOOPBACK ONLY so it is never
+    # exposed off this machine. Requires OPENCLAW_GATEWAY_BIND=lan (so the gateway
+    # listens on the container's real interface, which Docker's port publish can
+    # reach). Enable by appending this file to COMPOSE_FILE in .env; remove it to
+    # restore the locked-down default. Do NOT bind to 0.0.0.0 — the Control UI is
+    # an admin surface (chat, config, exec approvals).
+    ports:
+      - "127.0.0.1:18789:18789"

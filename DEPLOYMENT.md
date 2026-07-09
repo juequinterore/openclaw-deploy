@@ -621,6 +621,45 @@ capability; the persona makes the call.
 4. The coordinator relays that answer to the user in its own channel reply — the
    user sees one bot.
 
+### Validating the coordinator (dashboard vs. local TUI)
+
+**Do not test the coordinator from the local `chat` TUI.** The interactive TUI
+registers as a restricted Gateway client and **withholds `sessions_send`** — you
+will see only `sessions_list`/`sessions_history`, and `main` reports that
+`sessions_send` "isn't available". Cross-session tools are exposed on the
+surfaces that matter — **headless `agent` runs, the dashboard, and Slack** — not
+the local TUI. (This is easy to mistake for a broken config; it isn't.)
+
+Two ways to validate:
+
+- **Headless one-shot** — the same check `setup.sh --agents` runs:
+  ```bash
+  docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
+    --agent main --message "echo: banana" --json --timeout 120
+  ```
+  Expect `ECHO-BOT>>` in the output.
+
+- **Dashboard (Control UI)** — to drive it by hand. The template binds the
+  gateway to loopback with no published port, so the dashboard is unreachable by
+  default. Opt into the bundled `docker-compose.dashboard.yml` override, which
+  publishes the port to the **host loopback only**:
+  ```bash
+  # macOS sed shown; on Linux drop the '' after -i
+  sed -i '' 's/^OPENCLAW_GATEWAY_BIND=.*/OPENCLAW_GATEWAY_BIND=lan/' .env
+  grep -q docker-compose.dashboard.yml .env || \
+    sed -i '' 's|^COMPOSE_FILE=.*|&:docker-compose.dashboard.yml|' .env
+  docker compose up -d openclaw-gateway     # up -d, not restart
+  ```
+  Then browse `http://127.0.0.1:18789/` (auth token = `OPENCLAW_GATEWAY_TOKEN`
+  from `.env`). On a **remote** host do NOT publish beyond loopback — keep the
+  override and tunnel in: `ssh -N -L 18789:127.0.0.1:18789 user@host`.
+
+  **Revert** to the locked-down default afterwards: remove
+  `:docker-compose.dashboard.yml` from `COMPOSE_FILE`, set
+  `OPENCLAW_GATEWAY_BIND=loopback`, then `docker compose up -d openclaw-gateway`.
+  The Control UI is an admin surface (chat, config, exec approvals) — never bind
+  it to `0.0.0.0`.
+
 ### Adding real specialists
 
 1. Add an `agents.list[]` entry with its own `id`, an `identity.name`, a
