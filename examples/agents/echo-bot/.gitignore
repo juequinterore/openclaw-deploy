@@ -1,0 +1,10 @@
+# OpenClaw runtime/state byproducts — never commit these (AGENTS-PLUGINS.md §3.2).
+openclaw-workspace-state.json
+memory/
+sessions/
+agent/
+.openclaw/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env

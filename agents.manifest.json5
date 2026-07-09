@@ -1,0 +1,25 @@
+// Deployment manifest for `./setup.sh --sync-agents` — see AGENTS-PLUGINS.md
+// for the full contract. This is the single source of truth for
+// `agents.list` in openclaw.json: agents added by hand, outside this file,
+// are foreign to the sync and will make it abort (see "Foreign agents" in
+// AGENTS-PLUGINS.md §5.1).
+//
+// The default entry below is the reference/demo package (a local path, not
+// git — so a fresh clone works offline). Replace or add to it with your own
+// agents, e.g.:
+//
+//   { source: "git@github.com:acme/openclaw-billing.git", ref: "v1.2.0" },
+//
+{
+  // Optional global coordinator knobs — defaults shown; uncomment to override.
+  // coordinator: {
+  //   id: "main",
+  //   name: "🧭 Front Desk",
+  //   maxPingPongTurns: 0,
+  //   defaultTimeoutMs: 180000,
+  // },
+
+  agents: [
+    { source: "examples/agents/echo-bot", ref: null },
+  ],
+}

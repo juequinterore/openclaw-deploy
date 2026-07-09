@@ -1,0 +1,11 @@
+// Reference agent package for the pluggable-agents format (see AGENTS-PLUGINS.md).
+// This is the Model A self-description: it lives at the package repo root
+// (not inside workspace/, so it never leaks into the agent's tool cwd).
+{
+  id: "echo-bot",
+  name: "🔁 Echo Bot",
+  role: "Test specialist: echoes back whatever it's sent. No real capability.",
+  tools: { profile: "messaging" },
+  identity: { emoji: "🔁" },
+  notes: "Reference/demo package only — the default agents.manifest.json5 points here via a local source so a fresh clone has a working offline demo without reaching the network.",
+}
