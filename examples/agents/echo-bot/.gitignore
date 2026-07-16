@@ -7,4 +7,7 @@ agent/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+# Sync-generated per-agent Python site (AGENTS-PLUGINS.md §7.3) — wiped and
+# reinstalled from the committed lock on every sync.
+.python-site/
 .env

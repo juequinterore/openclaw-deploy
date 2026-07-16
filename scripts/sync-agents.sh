@@ -157,6 +157,197 @@ write_disabled_features_md() {
   [[ ${#tools[@]} -gt 0 ]] && echo "- Tools denied: ${tools[*]}"
 }
 
+# Collect the env var NAMES (never values) that have a non-empty value across
+# the deployment's secret sources. This is what the container process actually
+# sees: docker-compose loads ROOT_DIR/.env via `env_file` into both services,
+# and OpenClaw additionally loads the state-dir .env at gateway start. A name
+# present with a non-empty value in EITHER counts as provided (AGENTS-PLUGINS.md
+# §7.2). Only names are ever read out — values stay in the file.
+collect_env_names() {
+  local f line key val
+  for f in "$@"; do
+    [[ -f "$f" ]] || continue
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line#"${line%%[![:space:]]*}"}"        # ltrim leading whitespace
+      if [[ "$line" == export[[:space:]]* ]]; then
+        line="${line#export}"; line="${line#"${line%%[![:space:]]*}"}"
+      fi
+      [[ "$line" == \#* || "$line" != *=* ]] && continue
+      key="${line%%=*}"; val="${line#*=}"
+      [[ -z "$val" ]] && continue                     # present-but-empty == missing
+      [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+      printf '%s\n' "$key"
+    done < "$f"
+  done | sort -u
+}
+
+# Install a materialized agent's npm skill dependencies INSIDE the image
+# (AGENTS-PLUGINS.md §7.1) so node_modules is Linux-native and (on Linux) ends
+# up uid-1000-owned like the rest of the workspace after the chown below. The
+# container path mirrors the host dst under the config-dir mount. `npm ci` is
+# used — deterministic from the committed lockfile — with lifecycle scripts
+# OFF unless the deployer opted in via the manifest's `allowInstallScripts`.
+install_skill_deps() {
+  local id="$1" dst="$2" allow_scripts="$3"
+  [[ -d "$dst" ]] || return 0
+  local pj d rel container_dir flags
+  while IFS= read -r -d '' pj; do
+    d=$(dirname "$pj")
+    rel="${d#"$dst"}"; rel="${rel#/}"          # "" at workspace root, else "skills/x/y"
+    # A package.json that declares no dependencies is not an install target —
+    # e.g. a workspace-root file that only holds orchestration `scripts`.
+    # Nothing to install → no lockfile needed → skip it.
+    if ! jq -e '((.dependencies//{})|length)+((.devDependencies//{})|length)+((.optionalDependencies//{})|length) > 0' "$pj" >/dev/null 2>&1; then
+      continue
+    fi
+    if [[ ! -f "$d/package-lock.json" && ! -f "$d/npm-shrinkwrap.json" ]]; then
+      fail "$id: ${rel:-.} has dependencies but no lockfile — commit package-lock.json ('npm ci' requires it) or remove the package."
+    fi
+    rel="${rel:-.}"
+    container_dir="/home/node/.openclaw/agents/$id/workspace${rel:+/$rel}"
+    [[ "$rel" == "." ]] && container_dir="/home/node/.openclaw/agents/$id/workspace"
+    # --include=dev is REQUIRED: the image runs NODE_ENV=production (npm omits
+    # devDependencies by default), but skills that run TypeScript directly via
+    # `node --import tsx` keep tsx/typescript in devDependencies — omitting them
+    # makes `npm ci` a silent no-op and the skill crashes at runtime.
+    flags="--include=dev --no-audit --no-fund"
+    if [[ "$allow_scripts" == "true" ]]; then
+      log "    npm ci (lifecycle scripts ENABLED): $id/$rel"
+    else
+      flags="$flags --ignore-scripts"
+      log "    npm ci: $id/$rel"
+    fi
+    docker compose run -T --rm --entrypoint sh openclaw-cli \
+      -c "cd '$container_dir' && npm ci $flags" \
+      || fail "npm ci failed for $id/$rel — see output above."
+  done < <(find "$dst" -type f -name package.json -not -path '*/node_modules/*' -print0)
+}
+
+# Install a materialized agent's Python runtime dependencies
+# (AGENTS-DEPS-SPEC.md §3), symmetric with install_skill_deps above but into
+# ONE per-agent site: <workspace>/.python-site. The base image's constant
+# sitecustomize hook (§3.4) resolves this at runtime by walking up from the
+# tool cwd, so every pyproject.toml/requirements*.txt found anywhere under the
+# workspace installs into the SAME site (unlike node_modules, which Node's own
+# resolver finds per-directory — Python needs no per-directory site). Runs
+# in-image, after copy and before the Linux chown, so wheels are Linux-native
+# and end up uid-1000-owned like the rest of the workspace.
+#
+# Sets the global PY_PLAYWRIGHT_LOCKLINE[$id] (an associative array declared
+# by the caller) to the exact pinned `playwright==X.Y.Z` line if any resolved
+# lock pins it — used by the OS-dep preflight step to auto-derive
+# playwrightBrowsers (§6.2) and to version-match the base image's browser
+# install.
+install_python_deps() {
+  local id="$1" dst="$2" allow_scripts="$3"
+  [[ -d "$dst" ]] || return 0
+
+  local -a lock_container_paths=()
+  local f d rel container_dir
+  local -A seen_dirs=()
+
+  while IFS= read -r -d '' f; do
+    d=$(dirname "$f")
+    [[ -n "${seen_dirs[$d]:-}" ]] && continue
+    seen_dirs["$d"]=1
+
+    rel="${d#"$dst"}"; rel="${rel#/}"; rel="${rel:-.}"
+    container_dir="/home/node/.openclaw/agents/$id/workspace"
+    [[ "$rel" != "." ]] && container_dir="$container_dir/$rel"
+
+    # --- gather runtime requirement lines for this project root (§3.1) ---
+    local -a req_lines=()
+
+    if [[ -f "$d/pyproject.toml" ]]; then
+      # stdout (the JSON) and stderr (docker compose's own progress lines,
+      # e.g. "Container ... Creating") MUST be captured separately — merging
+      # them with 2>&1 corrupts the JSON and makes jq silently yield nothing,
+      # which looks exactly like "no dependencies" instead of a real failure.
+      local pj_deps pj_err
+      pj_err=$(mktemp)
+      if ! pj_deps=$(docker compose run -T --rm --entrypoint python3 openclaw-cli -c '
+import tomllib, json, sys
+with open(sys.argv[1], "rb") as fh:
+    data = tomllib.load(fh)
+print(json.dumps(data.get("project", {}).get("dependencies", [])))
+' "$container_dir/pyproject.toml" 2>"$pj_err"); then
+        local pj_err_text; pj_err_text=$(cat "$pj_err"); rm -f "$pj_err"
+        fail "$id: failed to parse ${rel}/pyproject.toml with tomllib:
+$pj_err_text"
+      fi
+      rm -f "$pj_err"
+      while IFS= read -r line; do
+        [[ -n "$line" ]] && req_lines+=("$line")
+      done < <(jq -r '.[]? // empty' <<<"$pj_deps")
+    else
+      # requirements*.txt is only read as a dependency SOURCE when there's no
+      # pyproject.toml alongside it — when both exist, pyproject.toml is
+      # authoritative and a sibling requirements.txt is dev/test convenience
+      # (e.g. `.` + `pytest`, a real example from the wild: it exists only so
+      # `pip install -e . pytest` works locally, and yields zero runtime deps
+      # here). Dev/test-NAMED files (requirements-dev.txt, ...) are skipped
+      # even in the no-pyproject.toml case.
+      local rf base line
+      for rf in "$d"/requirements*.txt; do
+        [[ -f "$rf" ]] || continue
+        base=$(basename "$rf")
+        [[ "$base" =~ [Dd][Ee][Vv]|[Tt][Ee][Ss][Tt] ]] && continue
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          line="${line%%#*}"                            # strip comments
+          line="${line#"${line%%[![:space:]]*}"}"        # ltrim
+          line="${line%"${line##*[![:space:]]}"}"        # rtrim
+          [[ -z "$line" ]] && continue
+          [[ "$line" =~ ^(-e|--editable)?[[:space:]]*\.$ ]] && continue   # self-reference
+          req_lines+=("$line")
+        done < "$rf"
+      done
+    fi
+
+    [[ ${#req_lines[@]} -eq 0 ]] && continue   # nothing to install from this root
+
+    # --- resolve a fully '=='-pinned lock (D2 — requirements.lock, else a
+    # fully pinned requirements.txt; no other lock format in v1, §3.2) ---
+    local lock_file=""
+    if [[ -f "$d/requirements.lock" ]] && ! grep -Ev '^[[:space:]]*(#.*)?$' "$d/requirements.lock" | grep -qv '=='; then
+      lock_file="$d/requirements.lock"
+    elif [[ -f "$d/requirements.txt" ]] && ! grep -Ev '^[[:space:]]*(#.*)?$' "$d/requirements.txt" | grep -qv '=='; then
+      lock_file="$d/requirements.txt"
+    fi
+    if [[ -z "$lock_file" ]]; then
+      fail "$id: ${rel} declares Python dependencies but ships no fully '=='-pinned lock — commit requirements.lock (or a fully pinned requirements.txt), e.g. via 'uv pip compile', 'pip-compile', or 'pip freeze'."
+    fi
+
+    local pw_line
+    pw_line=$(grep -iE '^playwright([=<>! ].*)?$' "$lock_file" | head -1 || true)
+    [[ -n "$pw_line" ]] && PY_PLAYWRIGHT_LOCKLINE["$id"]="$pw_line"
+
+    local lock_rel="${lock_file#"$d/"}"
+    lock_container_paths+=("$container_dir/$lock_rel")
+  done < <(find "$dst" \( -name pyproject.toml -o -name 'requirements*.txt' \) -type f \
+             -not -path '*/node_modules/*' -not -path '*/.python-site/*' -print0)
+
+  [[ ${#lock_container_paths[@]} -eq 0 ]] && return 0
+
+  local site_container="/home/node/.openclaw/agents/$id/workspace/.python-site"
+  rm -rf "$dst/.python-site"   # wiped + reinstalled every sync — same idempotency as node_modules
+
+  local bin_flag="--only-binary=:all:"
+  if [[ "$allow_scripts" == "true" ]]; then
+    log "    pip install (sdists ALLOWED): $id"
+    bin_flag=""
+  else
+    log "    pip install --only-binary=:all:: $id"
+  fi
+
+  local -a pip_args=(-m pip install --target "$site_container" --no-deps --no-input)
+  [[ -n "$bin_flag" ]] && pip_args+=("$bin_flag")
+  local p
+  for p in "${lock_container_paths[@]}"; do pip_args+=(-r "$p"); done
+
+  docker compose run -T --rm --entrypoint python3 openclaw-cli "${pip_args[@]}" \
+    || fail "pip install failed for $id — see output above."
+}
+
 # --- 1. preflight --------------------------------------------------------
 log "Preflight checks"
 # Uses mapfile, associative arrays, and empty-array expansion under `set -u`
@@ -290,9 +481,39 @@ COORD_JSON=$(jq -c '.data.coordinator' <<<"$RESULT2")
 COORDINATOR_ID=$(jq -r '.id' <<<"$COORD_JSON")
 EFFECTIVE_AGENTS_JSON=$(jq -c '.data.effectiveAgents' <<<"$RESULT2")
 
+# --- 3b. validate declared env vars (fail-loud, before copy/patch) -------
+# Turn "silent skill failure at runtime because a token wasn't set" into a
+# pre-flight error. Names are declared in the package's openclaw.agent.json5
+# (or inline in the manifest); values live only in the deployment's .env
+# (AGENTS-PLUGINS.md §7.2). Runs after clones but before anything is copied or
+# the config is touched — consistent with "nothing was written".
+log "Validating declared environment variables against the deployment .env"
+ENV_NAMES=$(collect_env_names "$ROOT_DIR/.env" "$CONFIG_DIR/.env")
+mapfile -t ENV_ROWS < <(jq -c '.[]' <<<"$EFFECTIVE_AGENTS_JSON")
+declare -a MISSING_REQUIRED=()
+for row in "${ENV_ROWS[@]}"; do
+  [[ -z "$row" ]] && continue
+  id=$(jq -r '.id' <<<"$row")
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    grep -qxF -- "$name" <<<"$ENV_NAMES" || MISSING_REQUIRED+=("$id: $name")
+  done < <(jq -r '.env.required[]? // empty' <<<"$row")
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    grep -qxF -- "$name" <<<"$ENV_NAMES" \
+      || warn "optional env var not set for '$id': $name — the agent should degrade gracefully without it."
+  done < <(jq -r '.env.optional[]? // empty' <<<"$row")
+done
+if [[ ${#MISSING_REQUIRED[@]} -gt 0 ]]; then
+  echo "Required environment variables are missing (or empty) in the deployment .env:" >&2
+  printf '  - %s\n' "${MISSING_REQUIRED[@]}" >&2
+  fail "Set them in $ROOT_DIR/.env, then re-run. Secrets never go in an agent repo (names shown above, values are yours to fill)."
+fi
+
 # --- 4. mirror-copy workspaces, skip disabled skills, chown on Linux ----
 log "Materializing workspaces"
 mapfile -t EFF_ROWS < <(jq -c '.[]' <<<"$EFFECTIVE_AGENTS_JSON")
+declare -A PY_PLAYWRIGHT_LOCKLINE=()   # agent id -> pinned "playwright==X.Y.Z" line (§6.2)
 for row in "${EFF_ROWS[@]}"; do
   [[ -z "$row" ]] && continue
   slug=$(jq -r '.slug' <<<"$row")
@@ -311,12 +532,96 @@ for row in "${EFF_ROWS[@]}"; do
   else
     rm -f "$dst/DISABLED_FEATURES.md"
   fi
+  # Install any npm-based / Python skill deps that shipped a lockfile. Runs on
+  # the just-copied tree (so disabled/skip-copied skills are already absent),
+  # in the image, before the Linux chown below reclaims ownership to uid 1000.
+  allow_scripts="$(jq -r '.allowInstallScripts // false' <<<"$row")"
+  install_skill_deps "$id" "$dst" "$allow_scripts"
+  install_python_deps "$id" "$dst" "$allow_scripts"
 done
 
 if [[ "$(uname -s)" == "Linux" ]]; then
   log "Linux detected: chowning materialized workspaces to uid 1000"
   if [[ "$(id -u)" -eq 0 ]]; then chown -R 1000:1000 "$CONFIG_DIR/agents"
   else sudo chown -R 1000:1000 "$CONFIG_DIR/agents"; fi
+fi
+
+# --- 4b. OS/system dependency preflight (AGENTS-DEPS-SPEC.md §6.3) ---------
+# Validates declared/detected OS needs against the RUNNING image; never
+# builds one (validate-and-instruct — D1). On any miss, aborts before the
+# config patch below and prints the exact Dockerfile lines to append.
+log "Validating OS-level dependencies against the running image"
+declare -A NEEDED_APT=()   # apt package -> comma-joined agent ids that need it
+declare -A NEEDED_PW=()    # playwright browser -> comma-joined agent ids
+for row in "${EFF_ROWS[@]}"; do
+  [[ -z "$row" ]] && continue
+  id=$(jq -r '.id' <<<"$row")
+  # system.apt only takes effect when this box opted in (§6.1) — otherwise
+  # the request is silently dropped, same as npm scripts default off.
+  if [[ "$(jq -r '.allowSystemDeps // false' <<<"$row")" == "true" ]]; then
+    while IFS= read -r pkg; do
+      [[ -z "$pkg" ]] && continue
+      NEEDED_APT["$pkg"]="${NEEDED_APT[$pkg]:+${NEEDED_APT[$pkg]},}$id"
+    done < <(jq -r '.system.apt[]? // empty' <<<"$row")
+  fi
+  while IFS= read -r browser; do
+    [[ -z "$browser" ]] && continue
+    NEEDED_PW["$browser"]="${NEEDED_PW[$browser]:+${NEEDED_PW[$browser]},}$id"
+  done < <(jq -r '.system.playwrightBrowsers[]? // empty' <<<"$row")
+  # Self-describing detection (§6.2): playwright found in this agent's Python
+  # deps implies playwrightBrowsers: ["chromium"], unless the agent (or the
+  # manifest) explicitly gave its own set (even an empty one, to opt out).
+  if [[ "$(jq -r '(.system.playwrightBrowsers != null)' <<<"$row")" != "true" \
+      && -n "${PY_PLAYWRIGHT_LOCKLINE[$id]:-}" ]]; then
+    NEEDED_PW["chromium"]="${NEEDED_PW[chromium]:+${NEEDED_PW[chromium]},}$id"
+  fi
+done
+
+MISSING_OS=0
+DOCKERFILE_SNIPPET=""
+for pkg in "${!NEEDED_APT[@]}"; do
+  if ! docker compose run -T --rm --entrypoint sh openclaw-cli -c "dpkg -s '$pkg'" >/dev/null 2>&1; then
+    warn "OS package '$pkg' (needed by: ${NEEDED_APT[$pkg]}) not present in the running image."
+    DOCKERFILE_SNIPPET+="RUN apt-get update && apt-get install -y --no-install-recommends $pkg && rm -rf /var/lib/apt/lists/*
+"
+    MISSING_OS=1
+  fi
+done
+for browser in "${!NEEDED_PW[@]}"; do
+  # Best-effort presence check only (a browser dir exists under
+  # PLAYWRIGHT_BROWSERS_PATH) — it does NOT confirm the installed build
+  # matches every requesting agent's pinned Playwright version. Confirming
+  # that end to end is flagged as a to-confirm-during-implementation item
+  # (AGENTS-DEPS-SPEC.md §12); if it proves fussy across mixed versions, the
+  # documented fallback is one Playwright version per box.
+  if ! docker compose run -T --rm --entrypoint sh openclaw-cli -c \
+      "find \"\${PLAYWRIGHT_BROWSERS_PATH:-/opt/ms-playwright}\" -maxdepth 1 -iname '${browser}-*' 2>/dev/null | grep -q ." \
+      >/dev/null 2>&1; then
+    warn "Playwright browser '$browser' (needed by: ${NEEDED_PW[$browser]}) not found in the running image."
+    pw_spec=""
+    for pw_id in ${NEEDED_PW[$browser]//,/ }; do
+      if [[ -n "${PY_PLAYWRIGHT_LOCKLINE[$pw_id]:-}" ]]; then pw_spec="${PY_PLAYWRIGHT_LOCKLINE[$pw_id]}"; break; fi
+    done
+    # --break-system-packages: this is a root-level, image-only install (to
+    # get the `playwright` CLI so `install --with-deps` can run) on a Debian
+    # base marking its system Python "externally managed" (PEP 668) — pip
+    # otherwise refuses a bare (non---target) install here.
+    DOCKERFILE_SNIPPET+="RUN pip install --no-cache-dir --break-system-packages \"${pw_spec:-playwright}\" \\
+ && python3 -m playwright install --with-deps $browser \\
+ && chmod -R a+rX \"\${PLAYWRIGHT_BROWSERS_PATH:-/opt/ms-playwright}\"
+"
+    MISSING_OS=1
+  fi
+done
+
+if [[ "$MISSING_OS" -eq 1 ]]; then
+  echo >&2
+  echo "OS-level dependencies are missing from the running image. Append these lines to" >&2
+  echo "the base Dockerfile (above the trailing comment marker), then rebuild:" >&2
+  echo >&2
+  printf '%s' "$DOCKERFILE_SNIPPET" >&2
+  echo >&2
+  fail "docker compose build && docker compose up -d openclaw-gateway, then re-run ./setup.sh --sync-agents. Nothing has been changed yet (validate-and-instruct, not auto-build — AGENTS-DEPS-SPEC.md §6.3)."
 fi
 
 # --- 5. assemble agents.list + sync-owned keys, diff, patch -------------

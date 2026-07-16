@@ -10,7 +10,11 @@
 > the pinned image (`2026.6.11`) or its `config schema` on 2026-07-09; the
 > implementation itself was exercised end to end against a live deployment on
 > the same date, including the foreign-agent abort/`--prune` path and
-> capability-subtraction (`disableSkills`/`denyTools`) path.
+> capability-subtraction (`disableSkills`/`denyTools`) path. **Extended
+> 2026-07-15** with auto-extracted Python dependencies, Python as a
+> first-class base-image runtime, and a declared+self-describing OS-deps
+> channel — §7.3/§7.4 below; full design and live verification in
+> `AGENTS-DEPS-SPEC.md`.
 
 ## 1. Goal
 
@@ -53,7 +57,10 @@ Verified against `docs.openclaw.ai` and a live `2026.6.11` config. An agent is
    routing), `SOUL.md` (persona), `USER.md`, `TOOLS.md` (local tool notes),
    `HEARTBEAT.md`, optional `IDENTITY.md`, `MEMORY.md` (curated long-term
    memory), `memory/YYYY-MM-DD.md`, and `skills/`. The workspace is also the
-   agent's tool `cwd`, so it can carry its own `tools/` scripts and data.
+   agent's tool `cwd`, so it can carry its own `tools/` scripts and data. This
+   is the same fact §7.3's per-agent Python import hook (`sitecustomize.py`)
+   depends on: it resolves each agent's `.python-site` by walking up from
+   `cwd`, which is always somewhere under that agent's workspace.
 
 Hard facts that shape the whole design (all *(verified)*):
 
@@ -144,10 +151,24 @@ agent's tool `cwd`). Every field is optional except a stable `id`. It is a
   model: "anthropic/claude-sonnet-4-6",   // optional; else inherits deploy default
   skills: ["invoice-lookup"],             // per-agent skill allowlist (REPLACES defaults — verified, §2)
   identity: { emoji: "💳" },
+  env: {                                  // env var NAMES this agent needs (§7.2); values live in the deploy .env
+    required: ["HUBSPOT_ACCESS_TOKEN"],   // sync aborts if unset/empty
+    optional: ["TAVILY_API_KEY"],         // sync warns if unset
+  },
+  system: {                                // OS deps this agent needs (§7.4) — a REQUEST, gated by the deploy
+    apt: ["poppler-utils"],               // only installed if this box's manifest entry sets allowSystemDeps: true
+    // playwrightBrowsers is usually left unset — auto-derived from a
+    // detected `playwright` Python dependency (§7.4); give it explicitly
+    // only to request a different browser set.
+  },
   // Free-form note surfaced to reviewers; not consumed by the runtime:
-  notes: "Needs TAVILY_API_KEY for web lookups; degrades gracefully without it.",
+  notes: "Degrades gracefully without TAVILY_API_KEY (skips web enrichment).",
 }
 ```
+
+Python/npm runtime dependencies are **not** declared here — they're
+auto-extracted from standard manifests the package already ships
+(`package.json`+lockfile, `pyproject.toml`/`requirements*.txt`+lock — §7.1/§7.3).
 
 If a repo ships **no** `openclaw.agent.json5`, the deploy manifest must supply
 these fields inline (that is the Model-B fallback — see §4). So dumb/legacy repos
@@ -166,6 +187,9 @@ sessions/
 agent/                  # per-agent runtime state (auth, sqlite, codex-home)
 .openclaw/
 *.sqlite  *.sqlite-shm  *.sqlite-wal
+# Sync-generated per-agent Python site (§7.3) — wiped and reinstalled from
+# the committed lock on every sync, never authored by hand.
+.python-site/
 # Secrets: agents receive credentials from the DEPLOYMENT's .env at runtime,
 # never from files in the repo.
 .env
@@ -223,8 +247,11 @@ will be flagged (and, with `--prune`, removed) — see §5.1.
 Per-agent fields: `source` (git URL or local path, **required**), `ref` (tag /
 branch / SHA — required for git sources; pinning a **tag or SHA** is strongly
 recommended), `enabled` (default true), plus any `openclaw.agent.json5` field as
-an **override**, plus deploy-only subtractions `disableSkills` / `denyTools` and
-relay `timeoutMs` / `routeHint`.
+an **override** (including `env` and `system` — §7.2/§7.4), plus deploy-only
+subtractions `disableSkills` / `denyTools`, relay `timeoutMs` / `routeHint`,
+`allowInstallScripts` (default false — opt into npm/pip lifecycle scripts /
+sdist builds at install time, §7.1/§7.3), and `allowSystemDeps` (default false
+— opt into a package's requested `system.apt` OS packages, §7.4).
 
 ### 4.1 Format note
 
@@ -440,6 +467,178 @@ the agent's declared config — using **only per-agent, sync-owned mechanisms**:
 The deployment can only **subtract or narrow**; it cannot silently grant an
 agent more than the deploy's own ceilings allow (§10).
 
+### 7.1 Skill dependencies (npm)
+
+A workspace skill may ship code with npm dependencies — e.g. a TypeScript
+post-processor run as `node --import tsx src/index.ts`. The sync installs those
+dependencies **inside the pinned image**, immediately after a workspace is
+materialized (§6) and before the Linux `chown` that reclaims ownership to uid
+1000. Running in-image (not on the host) gives Linux-native, correctly-owned
+`node_modules` regardless of the deployer's OS.
+
+Mechanism — for every `package.json` under the materialized `workspace/` that
+sits next to a lockfile (and isn't inside a `node_modules/`):
+
+```sh
+docker compose run --rm --entrypoint sh openclaw-cli \
+  -c 'cd <container-path> && npm ci --include=dev --ignore-scripts --no-audit --no-fund'
+```
+
+- **Dependency-free `package.json` is skipped.** A `package.json` that declares
+  no `dependencies`/`devDependencies`/`optionalDependencies` is not an install
+  target — e.g. a workspace-root file that only holds orchestration `scripts`
+  (`build`/`test`) across sub-skills. Nothing to install, so no lockfile is
+  required or expected; the sync passes over it.
+- **`npm ci`, lockfile required (when there ARE deps).** A `package.json` that
+  *does* declare dependencies but ships no committed `package-lock.json` (or
+  `npm-shrinkwrap.json`) is a **fail-loud error** — `npm ci` needs the lockfile,
+  and the pin keeps installs reproducible (matches this repo's pin-everything
+  stance). There is deliberately no lockfile-less `npm install` fallback:
+  `npm install` resolves whatever satisfying versions exist at sync time, so it
+  is non-deterministic across syncs and hosts.
+- **`--include=dev` is mandatory, not cosmetic.** The image runs
+  `NODE_ENV=production`, so npm omits `devDependencies` by default *(verified:
+  `npm config get omit` → `dev` in image 2026.6.11)*. Skills that run TypeScript
+  directly keep `tsx`/`typescript` in `devDependencies`; omitting them makes
+  `npm ci` a **silent no-op** (installs zero packages, exits "up to date") and
+  the skill then crashes at runtime with an unresolved `tsx`. `--include=dev`
+  forces them in.
+- **Lifecycle scripts are OFF by default (`--ignore-scripts`).** `npm ci` runs
+  arbitrary `preinstall`/`postinstall` code from a third-party repo at sync
+  time — a direct escalation of the supply-chain surface (§10). Pure-JS/TS
+  skills don't need scripts. A deployer who genuinely needs them (native addon
+  build) sets `allowInstallScripts: true` on that agent's manifest entry; the
+  sync logs loudly when scripts are enabled.
+- **Idempotent.** The materialization mirror-copy has no `node_modules` in its
+  source, so a re-sync wipes and `npm ci` cleanly reinstalls from the (possibly
+  bumped) lockfile — no stale deps survive a ref change.
+- **Network.** In-image `npm ci` reaches the registry, so a host syncing
+  git-sourced agents with deps needs egress at sync time (parallels the git-auth
+  requirement in §6). Dependency-free packages (e.g. `echo-bot`) install
+  nothing and stay fully offline.
+
+### 7.2 Environment variables (declare-and-validate)
+
+Agents need secrets (API tokens) and config at runtime. Those values live
+**only in the deployment's own `.env`** — never in an agent repo (§3.2, §10).
+An agent package *declares the names it needs*; the sync *validates they are
+present* before wiring the agent in, turning "silent skill failure because a
+token wasn't set" into a pre-flight abort.
+
+Declaration — an `env` block in `openclaw.agent.json5` (Model A) or inline in
+the manifest entry (Model B / override). **Names only, ever — no values:**
+
+```json5
+env: {
+  required: ["HUBSPOT_ACCESS_TOKEN_NICK", "TAVILY_API_KEY"],  // missing → ABORT
+  optional: ["OPENAI_WHISPER_API_KEY"],                        // missing → warn
+}
+```
+
+- **Where values come from.** Both compose services load the repo-root `.env`
+  via `env_file`, so every variable there is in the gateway process env and is
+  inherited by skill subprocesses. OpenClaw also loads the state-dir `.env` at
+  gateway start. The sync treats a name as *provided* if it has a **non-empty**
+  value in **either** file (a present-but-empty `VAR=` counts as missing).
+- **Validation timing.** Runs after clones but before any copy or config
+  change — a missing `required` aborts with the offending `id: NAME` pairs and
+  the instruction to add them to the deployment `.env`; a missing `optional`
+  warns and continues. Values are never read into a variable or printed.
+- **A manifest `env` overrides the package's wholesale** (even `env: {}` blanks
+  the package's request), consistent with every other override field (§4).
+- **Known limitation — no per-agent isolation.** All agents share one container
+  and one `.env`, injected process-wide; `skills.entries.*` config is
+  deployment-global too *(verified, §2)*. So any agent's skill can read every
+  variable in the process env — there is no runtime env sandbox per agent. Two
+  agents wanting a variable of the *same name* collide. The mitigation is a
+  **convention, not a mechanism**: agents should namespace their variable names
+  (Sallie already does — `HUBSPOT_ACCESS_TOKEN_<USERID>`). True per-agent
+  isolation would need runtime support OpenClaw does not provide today.
+
+### 7.3 Skill dependencies (Python)
+
+Symmetric with §7.1's npm path, extended to Python (full design + live
+verification: `AGENTS-DEPS-SPEC.md`). A materialized workspace is a "Python
+project" wherever the sync finds a `pyproject.toml` with non-empty
+`[project].dependencies`, or a `requirements*.txt` with at least one real
+requirement line (excluding `node_modules/` and the generated `.python-site/`).
+**`pyproject.toml`, when present, is the sole dependency source for that
+directory** — any sibling `requirements*.txt` is treated as dev/test
+convenience and not parsed for deps (only read for extraction when there's no
+`pyproject.toml` there). This is confirmed against a real package in the
+wild: its `requirements.txt` is exactly `.` + `pytest` (no dev/test naming),
+which yields zero runtime deps precisely because its `pyproject.toml` is
+authoritative. Dev/test-**named** requirements files (`requirements-dev.txt`,
+…) are skipped too, in the no-`pyproject.toml` case. Editable self-references
+(`.`, `-e .`) are never runtime deps either way.
+
+- **A pinned lock is required**, same bar as npm's lockfile: a fully
+  `==`-pinned `requirements.lock`, or a `requirements.txt` that is itself fully
+  pinned (the output of `pip freeze` / `pip-compile` / `uv pip compile`).
+  Deps declared with no such lock → **fail loud**, with the fix in the
+  message. (`uv.lock`/`poetry.lock`/`Pipfile.lock` are not yet supported —
+  export to a pinned `requirements.txt` first.)
+- **Install target: one site per agent**, not per skill directory —
+  `<workspace>/.python-site`, installed in-image via `pip install --target
+  … --no-deps --only-binary=:all:` (the pip analogs of npm's `--ignore-scripts`:
+  no resolver, no third-party `setup.py` execution). Lifts to allow sdists
+  under the same per-agent `allowInstallScripts: true` that governs npm
+  lifecycle scripts (§7.1). Wiped and reinstalled from the lock on every sync
+  — same idempotency as `node_modules`.
+- **Resolved at runtime by a cwd-keyed import hook**, not a venv. Python does
+  not add the workspace to `sys.path` the way Node's resolver walks up to find
+  `node_modules`, so the base image (§7.4's Dockerfile) bakes in a constant
+  `sitecustomize.py`; it walks up from the tool `cwd` (always inside the
+  invoking agent's workspace — §2) to find the nearest `.python-site` and
+  prepends it to `sys.path`. This keeps `python` on `PATH` (no venv to
+  activate) while giving each agent its own installed deps. **Not** wired via
+  `PYTHONPATH`: live testing against a real plugged-in agent
+  (`AGENTS-DEPS-SPEC.md` §3.4's revision note) found OpenClaw's Bash/exec tool
+  doesn't inherit it into the subprocess env, so the hook instead overwrites
+  the interpreter's own stdlib `sitecustomize.py` directly (a fixed env var
+  can't be stripped if nothing depends on it). **Verified live** end to end,
+  through a real agent's own tool call (not just `docker exec`): the agent
+  with Python deps installed imported them successfully; a second agent with
+  none correctly could not (`ModuleNotFoundError`) — isolation intact, and
+  separately, two agents pinning conflicting `pydantic` versions each import
+  their own with neither seeing the other's packages.
+- **No per-agent env isolation needed for this one** (unlike §7.2): each
+  agent's site is a separate directory, so conflicting pins between agents are
+  structurally impossible — no merge, no conflict detector needed.
+
+### 7.4 OS-level / system dependencies
+
+OS libraries (a browser engine, a native library) aren't recorded in any
+machine-readable, pinned manifest, so they can't be auto-extracted like §7.1/
+§7.3 — and they install into image/root-owned system paths, which a per-agent
+workspace mount cannot reach. They are handled as a **declared, gated**
+request, plus one auto-derived case:
+
+- **`system.apt: [...]`** in `openclaw.agent.json5` (or a manifest override)
+  names OS packages a package needs. It's a *request*: it only takes effect
+  when that agent's manifest entry sets **`allowSystemDeps: true`** (default
+  false) — the same "package requests, deployer opts in" pattern as
+  `allowInstallScripts`.
+- **`system.playwrightBrowsers: [...]`** is usually left unset: if `playwright`
+  is detected among an agent's extracted Python deps (§7.3), the sync derives
+  `["chromium"]` automatically (Playwright's own installer resolves the exact
+  OS libs a browser needs, so that list is never hand-authored). Give it
+  explicitly only to request a different browser set, or `[]` to opt out of
+  auto-derivation.
+- **Realized as base-image layers, validated (not built) by the sync.** OS
+  deps only install into the committed base `Dockerfile` (§5 in
+  `AGENTS-DEPS-SPEC.md`; this repo now ships one, with Python + the §7.3 import
+  hook baked in). The sync itself never runs `docker build` — instead it
+  preflight-validates the union of gated `system.apt` + (explicit or derived)
+  `system.playwrightBrowsers` against the **running** image (`dpkg -s`; a
+  browser-directory presence check), and on any miss **aborts before touching
+  config**, printing the exact Dockerfile lines to append (including the
+  pinned Playwright version, when applicable) and the rebuild command. The
+  deployer appends, rebuilds, re-runs the sync.
+- See `AGENTS-DEPS-SPEC.md` §12 for the one open edge case: whether multiple
+  agents pinning *different* Playwright versions can truly coexist under one
+  browsers path, or whether a box needs a one-Playwright-version limit.
+
 ## 8. The generated coordinator persona (`main`'s `AGENTS.md`)
 
 The coordinator's `AGENTS.md` (at the default workspace, §5 step 1) is
@@ -638,7 +837,36 @@ Notes:
   specialist ids and the coordinator need not appear in it.
 - **`maxPingPongTurns` default `0`** — single exchange; raise to 1–2 only if
   specialists must ask clarifying questions.
-- **Design-doc-first** — this file; implementation is the next step.
+- **Skill deps: in-image `npm ci`, auto-detected** (§7.1) — any
+  `package.json`+lockfile under a materialized `workspace/` is installed inside
+  the image with `--include=dev` (image is `NODE_ENV=production`; runtime `tsx`
+  lives in devDeps) and `--ignore-scripts` by default (supply-chain gate;
+  per-agent `allowInstallScripts: true` opts in). No lockfile → fail loud.
+- **Env: declare names, validate presence, shared `.env`** (§7.2) — package or
+  manifest declares `env.required`/`env.optional` (names only); sync aborts on a
+  missing required, warns on a missing optional, before any copy or config
+  write. No per-agent env isolation (single shared container/`.env`); namespace
+  variable names by convention.
+- **Python deps: in-image `pip install --target`, per-agent site, auto-detected**
+  (§7.3, `AGENTS-DEPS-SPEC.md`) — `pyproject.toml`/`requirements*.txt` under a
+  materialized `workspace/` installs into that agent's own `.python-site`, via
+  `--no-deps --only-binary=:all:` (supply-chain gate, lifts under
+  `allowInstallScripts`). A fully `==`-pinned lock is required, same bar as
+  npm's lockfile. Resolved at runtime by a constant, cwd-keyed
+  `sitecustomize.py` hook baked into the base image — no venv, no shared
+  union; conflicting versions across agents coexist by construction.
+- **Python is a first-class runtime by default** — a committed base
+  `Dockerfile` (§5, `AGENTS-DEPS-SPEC.md`) adds pip + `python-is-python3` + the
+  import hook on top of the stock image, which ships neither.
+- **OS deps: gated-declared, self-describing Playwright, validate-not-build**
+  (§7.4, `AGENTS-DEPS-SPEC.md`) — `system.apt` only installs when a manifest
+  entry sets `allowSystemDeps: true`; a detected `playwright` Python dep
+  auto-derives `playwrightBrowsers: ["chromium"]` unless overridden. Both
+  realize only as base-image layers; the sync validates the running image and
+  aborts with the exact Dockerfile lines to append rather than building one
+  itself.
+- **Design-doc-first** — this file (and `AGENTS-DEPS-SPEC.md` for the
+  Python/OS-deps extension); implementation followed each spec.
 
 **Facts verified live (2026-07-09, image `2026.6.11`):** `require("json5")`
 available to the image's node; `agents.defaults.skipBootstrap` is a valid
@@ -668,6 +896,12 @@ basename only as fallback (image source — §7).
 - [x] `disableSkills` matches SKILL.md frontmatter `name` (fallback: dir
       basename), not the directory name (§7).
 - [x] `.env` present in a package → hard fail, copy nothing (§10, §4.2).
+- [x] Skill deps: in-image `npm ci --include=dev --ignore-scripts` per
+      lockfile'd `package.json`, after copy / before chown; no lockfile → fail;
+      `allowInstallScripts` opt-in (§7.1).
+- [x] Env: declared `env.required`/`optional` validated against the deploy
+      `.env` (names only) — missing required aborts, missing optional warns,
+      before any copy or config write (§7.2).
 - [x] `DISABLED_FEATURES.md` regenerated or deleted every sync (§7).
 - [x] `MEMORY.md` seed-only + protected-path mirror semantics (§6, §9).
 - [x] Relay verification via headless one-shot only, fresh session (§11).
@@ -677,6 +911,26 @@ basename only as fallback (image source — §7).
       auth on the VPS, the restart-interrupts-sessions caveat, AND rewrite the
       "Single point of contact" section — plus the old-`--agents` migration
       note (tighter `allow` + `maxPingPongTurns` defaults — §11 notes).
+- [x] Python deps: in-image `pip install --target <workspace>/.python-site
+      --no-deps --only-binary=:all:`, per project root under a materialized
+      `workspace/` (pyproject.toml via in-image `tomllib`, requirements*.txt by
+      plain parsing); missing pinned lock → fail; `allowInstallScripts` lifts
+      `--only-binary` too (§7.3, `AGENTS-DEPS-SPEC.md`).
+- [x] Committed base `Dockerfile` + `pyhook/sitecustomize.py` (cwd walk-up,
+      installed by overwriting the interpreter's stdlib copy — not
+      `PYTHONPATH`, which a real agent's tool doesn't inherit; see
+      `AGENTS-DEPS-SPEC.md` §3.4's revision note) + `PLAYWRIGHT_BROWSERS_PATH`
+      env — verified building, a two-agent conflicting-pydantic-versions
+      isolation test, AND (2026-07-16) a real plugged-in agent
+      (`onepagerbuilder`/Virginia) importing its installed deps through its
+      own Bash/exec tool, with a second agent correctly unable to (§7.3, §5).
+- [x] OS-dep preflight validator (`dpkg -s`, Playwright browser-dir presence)
+      that aborts before the config patch with the generated Dockerfile
+      snippet + rebuild command — validate-and-instruct, no auto-build (§7.4).
+- [x] `system`/`allowSystemDeps` added to `manifest-compiler.js`'s field sets,
+      validation, and effective-agent output, with unit tests
+      (`scripts/lib/manifest-compiler.test.js`, run via
+      `scripts/test-compiler.sh`).
 
 **Future (explicitly out of scope now):**
 - Git-backed memory (commit/push accumulated memory).

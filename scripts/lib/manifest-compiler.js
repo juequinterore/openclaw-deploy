@@ -22,17 +22,31 @@ const ID_RE = /^[a-z0-9][a-z0-9_-]*$/;
 
 // Fields recognized in an agent package's own openclaw.agent.json5 (§3.1).
 const PACKAGE_FIELDS = new Set([
-  "id", "name", "role", "tools", "model", "skills", "identity", "notes",
+  "id", "name", "role", "tools", "model", "skills", "identity", "notes", "env", "system",
 ]);
 // Deploy-only fields, valid ONLY in agents.manifest.json5 entries (§4).
+// `allowInstallScripts` is deploy-only on purpose: whether to run a third-party
+// package's npm lifecycle scripts at sync time is the deployer's security call,
+// not something the agent repo gets to request (§7.1). `allowSystemDeps` is the
+// same idea for root-level OS packages (AGENTS-DEPS-SPEC.md §6.1) — a package
+// may *declare* `system.apt`, but it only takes effect when the deployer opts
+// in on this box.
 const MANIFEST_ONLY_FIELDS = new Set([
-  "source", "ref", "enabled", "disableSkills", "denyTools", "timeoutMs", "routeHint",
+  "source", "ref", "enabled", "disableSkills", "denyTools", "timeoutMs",
+  "routeHint", "allowInstallScripts", "allowSystemDeps",
 ]);
 const MANIFEST_AGENT_FIELDS = new Set([...PACKAGE_FIELDS, ...MANIFEST_ONLY_FIELDS]);
 const MANIFEST_TOP_FIELDS = new Set(["coordinator", "agents"]);
 const COORDINATOR_FIELDS = new Set(["id", "name", "maxPingPongTurns", "defaultTimeoutMs"]);
 const TOOLS_REQUEST_FIELDS = new Set(["profile"]);
 const IDENTITY_FIELDS = new Set(["name", "theme", "emoji", "avatar"]);
+const ENV_FIELDS = new Set(["required", "optional"]);
+// OS-level deps a package requests (AGENTS-DEPS-SPEC.md §6.1): apt package
+// names, and an optional explicit Playwright browser set (else auto-derived
+// from detected Python deps — §6.2).
+const SYSTEM_FIELDS = new Set(["apt", "playwrightBrowsers"]);
+// POSIX-ish env var name (what a shell and Node both accept as a key).
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 const COORDINATOR_DEFAULTS = {
   id: "main",
@@ -52,12 +66,72 @@ function isPlainObject(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
+function isStringArray(v) {
+  return Array.isArray(v) && v.every((x) => typeof x === "string" && x.trim().length > 0);
+}
+
 function unknownFieldErrors(obj, allowed, label) {
   const errs = [];
   for (const k of Object.keys(obj)) {
     if (!allowed.has(k)) errs.push(`${label}: unknown field '${k}'`);
   }
   return errs;
+}
+
+// Validate and normalize an `env` declaration (§7.2) to {required, optional}
+// arrays of NAMES only — values never live here or anywhere in the repo. Pushes
+// any problems onto `errors` and returns a normalized block, or undefined when
+// none was declared. De-dupes and drops a name from `optional` if it is also
+// `required` (required wins).
+function normalizeEnv(env, label, errors) {
+  if (env === undefined) return undefined;
+  if (!isPlainObject(env)) {
+    errors.push(`${label}: 'env' must be an object with 'required'/'optional' arrays`);
+    return undefined;
+  }
+  errors.push(...unknownFieldErrors(env, ENV_FIELDS, `${label}.env`));
+  const out = { required: [], optional: [] };
+  for (const kind of ["required", "optional"]) {
+    if (env[kind] === undefined) continue;
+    if (!Array.isArray(env[kind])) {
+      errors.push(`${label}.env.${kind}: must be an array of env var names`);
+      continue;
+    }
+    for (const v of env[kind]) {
+      if (typeof v !== "string" || !ENV_NAME_RE.test(v)) {
+        errors.push(`${label}.env.${kind}: '${v}' is not a valid env var name`);
+      } else if (!out[kind].includes(v)) {
+        out[kind].push(v);
+      }
+    }
+  }
+  out.optional = out.optional.filter((v) => !out.required.includes(v));
+  return out;
+}
+
+// Validate and normalize a `system` declaration (AGENTS-DEPS-SPEC.md §6.1) to
+// {apt?, playwrightBrowsers?} — only the keys actually given are present, so a
+// caller can tell "not requested" (key absent) apart from "explicitly empty"
+// (key present as `[]`, e.g. to opt a package out of Playwright
+// auto-derivation — §6.2). Pushes problems onto `errors` and returns a
+// normalized block, or undefined when no `system` was declared at all.
+function normalizeSystem(system, label, errors) {
+  if (system === undefined) return undefined;
+  if (!isPlainObject(system)) {
+    errors.push(`${label}: 'system' must be an object`);
+    return undefined;
+  }
+  errors.push(...unknownFieldErrors(system, SYSTEM_FIELDS, `${label}.system`));
+  const out = {};
+  if (system.apt !== undefined) {
+    if (!isStringArray(system.apt)) errors.push(`${label}.system.apt: must be an array of (non-empty) strings`);
+    else out.apt = [...new Set(system.apt)];
+  }
+  if (system.playwrightBrowsers !== undefined) {
+    if (!isStringArray(system.playwrightBrowsers)) errors.push(`${label}.system.playwrightBrowsers: must be an array of (non-empty) strings`);
+    else out.playwrightBrowsers = [...new Set(system.playwrightBrowsers)];
+  }
+  return out;
 }
 
 // Cosmetic only (staging-dir naming) — not load-bearing for correctness.
@@ -188,6 +262,16 @@ function parseManifest(manifestText) {
         errors.push(`${label}: '${arrField}' must be an array`);
       }
     }
+    // Validate a manifest-side env override statically (fail-fast, before any
+    // fetch). A package-side env block is validated later, in post-fetch.
+    const envOverride = normalizeEnv(entry.env, label, errors);
+    const systemOverride = normalizeSystem(entry.system, label, errors);
+    if (entry.allowInstallScripts !== undefined && typeof entry.allowInstallScripts !== "boolean") {
+      errors.push(`${label}: 'allowInstallScripts' must be a boolean`);
+    }
+    if (entry.allowSystemDeps !== undefined && typeof entry.allowSystemDeps !== "boolean") {
+      errors.push(`${label}: 'allowSystemDeps' must be a boolean`);
+    }
 
     agents.push({
       index,
@@ -197,6 +281,8 @@ function parseManifest(manifestText) {
       isLocal: local,
       slug: slugify(source || `agent-${index}`),
       explicitId: entry.id || null,
+      allowInstallScripts: entry.allowInstallScripts === true,
+      allowSystemDeps: entry.allowSystemDeps === true,
       overrides: {
         name: entry.name,
         role: entry.role,
@@ -205,6 +291,15 @@ function parseManifest(manifestText) {
         skills: entry.skills,
         identity: entry.identity,
         notes: entry.notes,
+        // Presence-tracked separately from the normalized value: an explicit
+        // `env: {}` in the manifest should still override (blank out) a
+        // package's env request, so we key "was it given?" off entry.env.
+        env: entry.env,
+        envNormalized: envOverride,
+        // Same presence-tracking as env: an explicit `system: {}` overrides
+        // (blanks out) a package's system request wholesale.
+        system: entry.system,
+        systemNormalized: systemOverride,
         disableSkills: entry.disableSkills || [],
         denyTools: entry.denyTools || [],
         timeoutMs: entry.timeoutMs,
@@ -301,6 +396,22 @@ function lintPostfetch(input) {
       identity: ov.identity !== undefined ? ov.identity : packageConfig.identity,
     };
 
+    // Effective env (§7.2): a manifest `env` (even `{}`) overrides the
+    // package's request wholesale; otherwise use the package's own block.
+    // The manifest side was already validated in parseManifest; validate the
+    // package side here (it's only now been parsed).
+    const effectiveEnv = ov.env !== undefined
+      ? ov.envNormalized
+      : normalizeEnv(packageConfig.env, `${label} openclaw.agent.json5`, errors);
+
+    // Effective system (AGENTS-DEPS-SPEC.md §6.1): same override-wholesale
+    // pattern as env — a manifest `system` (even `{}`) replaces the package's
+    // request; otherwise use the package's own block (validated here, now
+    // that packageConfig has been parsed).
+    const effectiveSystem = ov.system !== undefined
+      ? ov.systemNormalized
+      : normalizeSystem(packageConfig.system, `${label} openclaw.agent.json5`, errors);
+
     if (!effective.id || typeof effective.id !== "string") {
       errors.push(`${label}: no id resolvable — package ships no openclaw.agent.json5 id and the manifest gives no override id`);
       continue;
@@ -367,6 +478,10 @@ function lintPostfetch(input) {
       denyTools,
       skillDirsToSkip,
       hasDisabledFeatures: disableSkills.length > 0 || denyTools.length > 0,
+      env: effectiveEnv || { required: [], optional: [] },
+      allowInstallScripts: a.allowInstallScripts === true,
+      system: effectiveSystem || undefined,
+      allowSystemDeps: a.allowSystemDeps === true,
     });
   }
 
@@ -468,4 +583,10 @@ function run(input) {
   }
 }
 
-process.stdout.write(JSON.stringify(run(INPUT)));
+// Guarded so this file can be concatenated ahead of a test script (piped to
+// the same in-image `node`, no INPUT defined) purely for its function
+// declarations, without trying to execute a phase — see
+// scripts/lib/manifest-compiler.test.js / scripts/test-compiler.sh.
+if (typeof INPUT !== "undefined") {
+  process.stdout.write(JSON.stringify(run(INPUT)));
+}

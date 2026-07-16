@@ -22,22 +22,31 @@ specialists" — that's a config feature of a *single* deployment (try
 docker-compose.yml          # vendored from upstream, pinned to tag v2026.6.11
 docker-compose.extra.yml    # our overrides: home volume, data-dir mounts, no ports
 docker-compose.dashboard.yml # opt-in: re-publish the gateway port to host loopback for the Control UI
+Dockerfile                  # optional: Python-enabled base image (see "Python & OS-level agent dependencies")
+pyhook/sitecustomize.py     # per-agent Python import hook baked into that image
 .env.example                # template — copy to .env and fill in
 .gitignore                  # excludes .env, .openclaw-data/, and .agents-src/
 setup.sh                    # automates "First-time setup" below; safe to re-run
 agents.manifest.json5        # declares pluggable agents for `setup.sh --sync-agents`
 scripts/sync-agents.sh       # implements --sync-agents (see AGENTS-PLUGINS.md)
 scripts/lib/manifest-compiler.js # its manifest/JSON5 logic, run inside the pinned image
+scripts/lib/manifest-compiler.test.js # unit tests for the compiler's pure functions
+scripts/test-compiler.sh     # runs the above inside the pinned image
 examples/agents/echo-bot     # reference agent package + the manifest's offline demo
 AGENTS-PLUGINS.md            # pluggable-agents format contract
+AGENTS-DEPS-SPEC.md          # Python/OS-level agent dependency extraction (extends AGENTS-PLUGINS.md §7)
 DEPLOYMENT.md                # this file
 ```
 
-No `Dockerfile` and no application source beyond the pieces above — `docker
-compose up -d` needs only the compose files, because `OPENCLAW_IMAGE` is
-pinned and already resolvable by tag, so Compose never touches the `build: .`
-fallback in `docker-compose.yml`. `scripts/` and `examples/` are this
-deployment's own tooling, not a copy of upstream OpenClaw source.
+No application source beyond the pieces above — by default `docker compose up
+-d` needs only the compose files, because `OPENCLAW_IMAGE` is pinned and
+already resolvable by tag, so Compose never touches the `build: .` fallback in
+`docker-compose.yml`. `scripts/` and `examples/` are this deployment's own
+tooling, not a copy of upstream OpenClaw source. The one optional exception is
+`Dockerfile` — a thin, committed layer that adds Python on top of the stock
+image, needed only if a plugged-in agent (via `agents.manifest.json5`) ships
+Python dependencies; see "Python & OS-level agent dependencies" below. Skip it
+entirely if every agent you run is npm-only (or has none).
 
 ## Summary of this setup
 
@@ -790,6 +799,53 @@ for the full package contract (a git repo with `openclaw.agent.json5` +
    refresh but its accumulated memory (anything past the seed `MEMORY.md`) is
    preserved.
 
+### Python & OS-level agent dependencies
+
+A plugged-in agent may ship Python code (`pyproject.toml`/`requirements*.txt`)
+alongside or instead of npm skills — auto-extracted the same way, symmetric
+with npm (full design + live verification: `AGENTS-DEPS-SPEC.md`; contract
+summary: `AGENTS-PLUGINS.md` §7.3/§7.4).
+
+**Only matters if an agent you plug in actually has Python deps.** The stock
+image has no `pip`, so nothing below is needed for an npm-only (or
+dependency-free) agent like `echo-bot`.
+
+1. **Build the Python-enabled base image once, locally:**
+   ```bash
+   # In .env, point OPENCLAW_IMAGE at a LOCAL tag — NOT the literal
+   # "openclaw:local" sentinel setup.sh's preflight rejects as "unset":
+   OPENCLAW_IMAGE=openclaw-deploy-py:2026.6.11
+
+   docker compose build
+   docker compose up -d openclaw-gateway
+   ```
+   This builds the committed `Dockerfile` (pip + `python-is-python3` + the
+   per-agent `pyhook/sitecustomize.py` import hook — see `AGENTS-DEPS-SPEC.md`
+   §3.4/§5), FROM the same pinned upstream tag this repo already tracks. Keep
+   the `Dockerfile`'s `FROM` tag and this `OPENCLAW_IMAGE` value in sync when
+   you bump versions (same ritual as "Updating the image version" above).
+2. **Ship the agent's Python deps as a fully `==`-pinned lock** —
+   `requirements.lock`, or a `requirements.txt` that's itself the output of
+   `pip freeze` / `pip-compile` / `uv pip compile`. An unpinned
+   `requirements.txt` with no accompanying lock fails the sync loudly, same as
+   a missing `package-lock.json` does for npm.
+3. **Sync as usual** (`./setup.sh --sync-agents`) — it installs each agent's
+   deps into its own `<workspace>/.python-site` (never a shared/merged
+   install; two agents can pin conflicting versions with no collision).
+4. **OS-level packages** (a native library, a Playwright browser) are not
+   auto-extractable — a package requests them via `system.apt` /
+   `system.playwrightBrowsers` in its `openclaw.agent.json5`, but they only
+   take effect on a manifest entry with `allowSystemDeps: true`:
+   ```json5
+   { source: "git@github.com:acme/openclaw-scraper.git", ref: "v1.0.0",
+     allowSystemDeps: true },
+   ```
+   The sync never builds the image itself — it validates the running image
+   and, on any miss, **aborts before touching config**, printing the exact
+   lines to append to the `Dockerfile`'s "OS deps requested by plugged-in
+   agents" section and the rebuild command from step 1. Append, rebuild,
+   re-run the sync.
+
 ### Prefer to route by identity instead of content?
 
 If different Slack channels/workspaces/users should map to different agents
@@ -903,7 +959,10 @@ See `docs.openclaw.ai/tools/subagents`.
   the cause: `Use the sessions_send tool to send "banana" to agent "echo-bot",
   wait for the reply, and return it` — a working result means it's persona
   wording, not plumbing.
-- **This repo has no `Dockerfile` and no application source, on purpose** —
-  don't `git clone` the full `openclaw/openclaw` project expecting to find
-  more here; everything needed to run is in this repo (the two compose files
-  plus your `.env`) alongside the pulled image.
+- **This repo has no application source, on purpose** — don't `git clone` the
+  full `openclaw/openclaw` project expecting to find more here; everything
+  needed to run is in this repo (the compose files plus your `.env`) alongside
+  the pulled image. The one committed `Dockerfile` is a thin, optional layer
+  that adds Python on top of that pulled image (see "Python & OS-level agent
+  dependencies") — it is not a copy of upstream source, and most deployments
+  never need to build it.

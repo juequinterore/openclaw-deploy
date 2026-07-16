@@ -21,5 +21,38 @@
 
   agents: [
     { source: "examples/agents/echo-bot", ref: null },
+
+    // Worked example — a real, pre-existing agent repo with no
+    // openclaw.agent.json5 (Model B: declare its shape inline). Sallie is a
+    // lead-intake specialist whose skills are TypeScript (installed in-image
+    // via npm ci — AGENTS-PLUGINS.md §7.1) and which needs HubSpot/Tavily
+    // secrets from THIS deployment's .env (declared by name — §7.2). Uncomment
+    // and pin a real ref to plug her in:
+    //
+    { source: "git@bitbucket.org:57blocks/sallie.git", ref: "chore/testing-standards-and-tests",
+      id: "sallie", name: "Sallie", role: "Event lead intake, scoring, HubSpot pushes.",
+      model: "anthropic/claude-sonnet-4-6",   // this deploy runs claude-cli, not her native gpt-5.4
+      tools: { profile: "coding" },
+      timeoutMs: 600000,                       // real HubSpot intake (extract + resolver CLI + create/note/associate) runs ~2-3 min; 180s default is too tight
+
+      env: {
+        // Only secret the branch's skill code actually reads at runtime
+        // (process.env["HUBSPOT_ACCESS_TOKEN"], shared/single-tenant — the
+        // per-user HUBSPOT_ACCESS_TOKEN_<ID> routing isn't wired yet).
+        required: ["HUBSPOT_ACCESS_TOKEN"],
+        // Voice intake; only matters if this deployment wires Whisper.
+        optional: ["OPENAI_WHISPER_API_KEY"],
+      } },
+
+    // NOTE: the Python-deps path (AGENTS-DEPS-SPEC.md) was validated live
+    // (2026-07-16) against onepagerbuilder/"Virginia", a real agent whose
+    // pyproject.toml declares beautifulsoup4/pillow/playwright/pydantic/
+    // python-dotenv — including a real agent Bash-tool invocation importing
+    // its installed deps. Her real repo (git@bitbucket.org:57blocks/
+    // onepagerbuilder.git) isn't wired in here because it ships no
+    // `workspace/` subdirectory (persona files sit at repo root) and no
+    // pinned Python lock — both need fixing upstream before a durable entry
+    // makes sense; see AGENTS-DEPS-SPEC.md §3.4's revision note and §12 for
+    // what the test actually exercised and found.
   ],
 }
