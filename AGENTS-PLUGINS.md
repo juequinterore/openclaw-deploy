@@ -572,19 +572,24 @@ authoritative. Dev/test-**named** requirements files (`requirements-dev.txt`,
 …) are skipped too, in the no-`pyproject.toml` case. Editable self-references
 (`.`, `-e .`) are never runtime deps either way.
 
-- **A pinned lock is required**, same bar as npm's lockfile: a fully
-  `==`-pinned `requirements.lock`, or a `requirements.txt` that is itself fully
-  pinned (the output of `pip freeze` / `pip-compile` / `uv pip compile`).
-  Deps declared with no such lock → **fail loud**, with the fix in the
-  message. (`uv.lock`/`poetry.lock`/`Pipfile.lock` are not yet supported —
-  export to a pinned `requirements.txt` first.)
+- **A pinned lock is preferred, not required** (revised 2026-07-16 — unlike
+  npm, which keeps its required-lockfile bar; see `AGENTS-DEPS-SPEC.md` §3.2 for
+  why the two paths differ). A fully-pinned `requirements.lock` / `requirements.txt`
+  (from `pip freeze` / `pip-compile` / `uv pip compile`; `--generate-hashes`,
+  URL refs, and env markers all accepted) installs reproducibly with the
+  resolver off. **With no lock, the sync resolves the declared deps at sync time
+  and warns** that the install isn't byte-reproducible across hosts/time — real
+  Python agents often ship only ranges, and this lets them plug in.
+  (`uv.lock`/`poetry.lock`/`Pipfile.lock` still aren't parsed as locks, but an
+  agent shipping only those now falls into the resolve path rather than failing.)
 - **Install target: one site per agent**, not per skill directory —
   `<workspace>/.python-site`, installed in-image via `pip install --target
-  … --no-deps --only-binary=:all:` (the pip analogs of npm's `--ignore-scripts`:
-  no resolver, no third-party `setup.py` execution). Lifts to allow sdists
-  under the same per-agent `allowInstallScripts: true` that governs npm
-  lifecycle scripts (§7.1). Wiped and reinstalled from the lock on every sync
-  — same idempotency as `node_modules`.
+  … --only-binary=:all:` (pip's supply-chain gate: no third-party `setup.py`
+  execution; lifts to allow sdists under the same per-agent
+  `allowInstallScripts: true` that governs npm lifecycle scripts, §7.1). Adds
+  `--no-deps` when a pinned lock drives the install; drops it (resolver on) in
+  the lockless case above. Wiped and reinstalled on every sync — same
+  idempotency as `node_modules`.
 - **Resolved at runtime by a cwd-keyed import hook**, not a venv. Python does
   not add the workspace to `sys.path` the way Node's resolver walks up to find
   `node_modules`, so the base image (§7.4's Dockerfile) bakes in a constant

@@ -69,8 +69,10 @@ USER node
 # `docker compose build && docker compose up -d openclaw-gateway` after
 # editing this section, then re-run `./setup.sh --sync-agents`.
 
-# virginia: Playwright browser auto-derived from its Python deps (§6.2) —
-# printed verbatim by the sync's OS-dep preflight validator.
+# virginia: Playwright chromium auto-derived from its Python `playwright` dep
+# (§6.2) — appended verbatim from the sync's OS-dep preflight output. Pinned to
+# the version the sync resolved into virginia's .python-site so the browser
+# build matches the per-agent pip package.
 USER root
 RUN pip install --no-cache-dir --break-system-packages "playwright==1.61.0" \
  && python3 -m playwright install --with-deps chromium \

@@ -44,15 +44,16 @@
         optional: ["OPENAI_WHISPER_API_KEY"],
       } },
 
-    // NOTE: the Python-deps path (AGENTS-DEPS-SPEC.md) was validated live
-    // (2026-07-16) against onepagerbuilder/"Virginia", a real agent whose
-    // pyproject.toml declares beautifulsoup4/pillow/playwright/pydantic/
-    // python-dotenv — including a real agent Bash-tool invocation importing
-    // its installed deps. Her real repo (git@bitbucket.org:57blocks/
-    // onepagerbuilder.git) isn't wired in here because it ships no
-    // `workspace/` subdirectory (persona files sit at repo root) and no
-    // pinned Python lock — both need fixing upstream before a durable entry
-    // makes sense; see AGENTS-DEPS-SPEC.md §3.4's revision note and §12 for
-    // what the test actually exercised and found.
+    // Virginia — the worked Python example (AGENTS-DEPS-SPEC.md). Her repo was
+    // restructured for the pluggable-agent contract on the branch below
+    // (workspace/ subdir + root openclaw.agent.json5). Ships NO pinned lock on
+    // purpose: exercises the resolve-at-sync-time path (revised D2, §3.2). Her
+    // pyproject declares beautifulsoup4/pillow/playwright/pydantic/python-dotenv
+    // (Python, into .python-site) and package.json declares openbrand (npm);
+    // `playwright` auto-derives a chromium browser layer (§7.4), so the first
+    // sync will abort with the exact Dockerfile lines to append (chromium is a
+    // root/apt image layer, never installed into a workspace).
+    { source: "git@bitbucket.org:57blocks/onepagerbuilder.git",
+      ref: "chore/openclaw-deploy-compat" },
   ],
 }

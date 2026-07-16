@@ -12,9 +12,11 @@
 > test #7) — and the built `Dockerfile` itself was re-verified end to end the
 > same day (build, pip/tomllib presence, `--target` install, and the
 > cwd-keyed `sitecustomize` hook isolating two conflicting-version installs).
-> The five design decisions (D1–D5) are settled and recorded in §9; §12 lists
-> items to confirm on a live multi-agent box (not blockers, and not yet
-> exercised against a real deployment — see the note there).
+> The five design decisions (D1–D5) are settled and recorded in §9 — **D2 was
+> revised 2026-07-16**: a pinned lock is now *preferred, not required* (Python
+> agents in the wild routinely ship only ranges — §3.2). §12 lists items to
+> confirm on a live multi-agent box (not blockers, and not yet exercised
+> against a real deployment — see the note there).
 >
 > See `AGENTS-PLUGINS.md` §7.3/§7.4 for the folded-in contract summary and
 > cross-links, and its §13 for the implementation checklist mirrored from
@@ -103,22 +105,40 @@ directory has **no** `pyproject.toml` does `requirements*.txt` get parsed as
 the dependency source, and dev/test-**named** files
 (`requirements-dev.txt`, …) are skipped there too.
 
-### 3.2 Determinism: a pinned lock is REQUIRED (symmetry with npm)
+### 3.2 Determinism: a pinned lock is PREFERRED, not required (revised D2)
 
-`npm ci` refuses to run without a lockfile; Python is held to the same bar. A
-project that declares runtime deps **must** ship a fully-pinned lock. **v1
-accepts exactly one form (decision D2):** a fully `==`-pinned
-`requirements.lock` / pinned `requirements.txt` — the output of `pip freeze`,
-`pip-compile`, or `uv pip compile`. It is trivially producible from every
-toolchain and needs a single code path with no format-specific exporters.
-Support for `uv.lock` / `poetry.lock` / `Pipfile.lock` (export-to-requirements)
-is **deferred** (§12) — not rejected, just not v1.
+**Revised (2026-07-16).** The original stance (a fully-pinned lock is
+*mandatory*, fail-loud otherwise — symmetric with `npm ci`) proved wrong for
+Python's ecosystem reality: unlike npm, where a committed `package-lock.json`
+is auto-generated and near-universal, real Python agents routinely ship only a
+`pyproject.toml` with **version ranges** and no lock at all (the worked-example
+agent, Virginia, is exactly this). Requiring a lock blocked those agents from
+plugging in. Node keeps its required-lockfile bar unchanged (§4) precisely
+because it matches how ~all Node repos already ship; Python does not, so the
+two paths intentionally differ. See §7.3 for that asymmetry, spelled out.
 
-**Deps declared but no pinned lock → fail-loud**, exactly like §7.1's
-"dependencies but no lockfile" error, with the fix in the message
-(`uv pip compile` / `pip-compile` / `pip freeze`). No lockless `pip install`
-fallback (it is non-deterministic across syncs and hosts — the same reasoning
-§7.1 uses to forbid lockless `npm install`).
+The behavior now:
+
+- **A pinned lock, when present, is still used and is the recommended path.**
+  Accepted forms: a fully `==`-pinned `requirements.lock`, or a
+  `requirements.txt` that is itself fully pinned (output of `pip freeze`,
+  `pip-compile`, or `uv pip compile`). "Fully pinned" accepts `==` pins,
+  `--hash`/continuation lines (`pip-compile --generate-hashes`), direct
+  URL/VCS references (an exact pin), and environment markers — an older
+  "`==` on every line" check wrongly rejected all but the first. When a lock
+  is present, the full set installs with the resolver **off** (`--no-deps`) —
+  byte-reproducible (§3.3).
+- **No lock → resolve at sync time, with a loud warning.** The sync installs
+  the *declared* deps (`[project].dependencies`, or a non-pinned
+  `requirements*.txt`) with pip's resolver **on**, and warns that the result is
+  **not** byte-reproducible across hosts/time, pointing at `uv pip compile` /
+  `pip-compile` / `pip freeze` as the fix. The supply-chain gate
+  (`--only-binary=:all:`, §3.3) still applies, so a lockless install still runs
+  no third-party `setup.py`.
+
+`uv.lock` / `poetry.lock` / `Pipfile.lock` are still not parsed as lock formats
+(§12) — but an agent shipping only those now falls into the resolve-at-sync
+path rather than failing, so nothing is *blocked* on them.
 
 ### 3.3 Install
 
@@ -139,9 +159,12 @@ docker compose run -T --rm --entrypoint sh openclaw-cli -c \
   same idempotency as `node_modules`; and `.python-site` is never mirror-copied
   from the package (it is generated), so it belongs in the agent repo's
   `.gitignore`.
-- **`--no-deps`** because a complete pinned lock already lists the full
-  transitive set; this removes the resolver from the path, making installs
-  byte-reproducible across syncs/hosts.
+- **`--no-deps` when installing from a pinned lock** because the lock already
+  lists the full transitive set; this removes the resolver from the path,
+  making installs byte-reproducible across syncs/hosts. **When no lock is
+  present (§3.2), the resolver runs** (`--no-deps` dropped) so the declared
+  deps still install — at the documented cost of cross-host/time
+  reproducibility, which the sync warns about.
 - **`--only-binary=:all:`** is the supply-chain gate, the pip analog of npm's
   `--ignore-scripts`: it forbids source distributions, so **no third-party
   `setup.py` runs at sync time**. An agent that genuinely needs an sdist opts in
@@ -313,12 +336,14 @@ libraries the browser needs — so **the list of OS libs is never hand-authored*
 its installed browser build must match. The pip package installs per-agent into
 `.python-site` like any other dep (§3.3); the matching **browser build + OS
 libs** install in the image (root/apt). Playwright versions its browser build
-directories, so multiple versions *can* coexist under one
-`PLAYWRIGHT_BROWSERS_PATH` — meaning per-agent isolation (§3.4) likely lets two
-agents run different Playwright versions, each finding its matching build. Treat
-that as the target but **confirm it end to end** (§12): if the build/driver
-match proves fussy, the fallback is a documented one-Playwright-version-per-box
-limit. The apt OS libs are a shared superset either way.
+directories, so multiple versions *could* in principle coexist under one
+`PLAYWRIGHT_BROWSERS_PATH`. **As of 2026-07-16 the box adopts the simpler
+one-Playwright-version-per-box rule** rather than betting on that: the preflight
+(§6.3) aborts if two agents pin different Playwright versions, and aborts if the
+running image's Playwright differs from the pin. This makes a version mismatch a
+loud sync-time error instead of a silent wrong-driver failure at runtime. True
+multi-version coexistence is deferred (§12) until a deployment needs it. The apt
+OS libs are a shared superset either way.
 
 ### 6.3 The sync's role: validate, don't silently build
 
@@ -366,9 +391,14 @@ blast radius small.)*
 
 - **Python is auto-extracted symmetrically with Node**, from
   `pyproject.toml`/`requirements*.txt`, parsed with in-image stdlib `tomllib`.
-- **A pinned lock is mandatory** for Python runtime deps (fail-loud otherwise) —
-  same stance as npm's required lockfile. **v1 accepts a pinned
-  `requirements.txt`/`.lock` only** (D2); other lock formats deferred (§12).
+- **A pinned lock is PREFERRED, not mandatory** for Python runtime deps
+  (revised D2, 2026-07-16 — §3.2): with a lock, install is reproducible
+  (`--no-deps`); without one, the sync resolves the declared deps and warns.
+  This intentionally diverges from npm's required-lockfile bar (§4/§7.3),
+  tracking the ecosystem difference — committed locks are near-universal in npm
+  but optional in Python. Accepted lock forms: fully-pinned
+  `requirements.lock`/`requirements.txt` (incl. `--generate-hashes`, URL refs,
+  markers); `uv.lock`/`poetry.lock`/`Pipfile.lock` still not parsed (§12).
 - **Python is isolated per agent** (D3): each agent installs its own lock into a
   per-agent `.python-site`, resolved at runtime by a constant cwd-keyed
   `sitecustomize` hook — no venv (keeps `python` on PATH), no per-agent OpenClaw
@@ -419,9 +449,10 @@ blast radius small.)*
       `allowSystemDeps` (manifest-only) to the field sets + validation; extend
       the effective-agent output with `system`/`allowSystemDeps`.
 - [x] `sync-agents.sh`: generalize `install_skill_deps` → also detect Python
-      projects (pyproject/requirements) under `$dst`, resolve the pinned lock (or
-      fail-loud), then per agent `pip install --target
-      <workspace>/.python-site --no-deps --only-binary=:all: -r <lock>`.
+      projects (pyproject/requirements) under `$dst`, then per agent
+      `pip install --target <workspace>/.python-site --only-binary=:all:`:
+      from a pinned lock with `--no-deps` when one is present, else resolving
+      the declared deps with a loud not-reproducible warning (revised D2, §3.2).
       (Implemented as a sibling `install_python_deps`, called alongside
       `install_skill_deps` — Python detection/extraction/self-ref-filtering/
       lock-resolution live entirely in bash+`python3`/`tomllib`, mirroring how
@@ -434,10 +465,10 @@ blast radius small.)*
       per-agent installs from each other via `cwd`.
 - [x] OS-dep preflight validator (`dpkg -s`, browser presence check) that
       aborts with the generated Dockerfile snippet + rebuild command
-      (validate-and-instruct — D1; no auto-build in v1). The browser check is
-      presence-only (a directory under `PLAYWRIGHT_BROWSERS_PATH`), not a full
-      driver/version match — see the §12 note below, carried forward as a
-      known limitation rather than resolved.
+      (validate-and-instruct — D1; no auto-build in v1). Playwright version is
+      now enforced alongside browser presence (2026-07-16): the preflight aborts
+      on conflicting pinned versions across agents and on an image-vs-pin
+      mismatch (one-version-per-box, §6.2/§6.3/§12) — no longer presence-only.
 - [x] Playwright: detect from deps → auto-derive `install --with-deps <browser>`
       snippet for the image (embedding the exact pinned `playwright==X.Y.Z`
       line extracted from the agent's lock, when available); keep the pip
@@ -493,12 +524,17 @@ blast radius small.)*
     image build. Fixed by adding `--break-system-packages` (safe here: this is
     a controlled, root-only, image-build-time install, not a shared multi-purpose
     Python environment).
-- **Playwright browser/driver version match** end to end (install its build in
-  the image, launch Chromium via `export_pdf`, produce a PDF) — confirms whether
-  multiple Playwright versions truly coexist (§6.2) or the box needs the
-  one-version fallback. **Still open** — the live test above used a single
-  agent/single Playwright version, so it did not exercise the multi-version
-  coexistence question.
+- **Playwright browser/driver version match** — **resolved by adopting the
+  one-version-per-box fallback now (2026-07-16), rather than betting on
+  multi-version coexistence.** The OS-dep preflight (§6.3) now (a) aborts if two
+  agents pin *different* Playwright versions, and (b) aborts if the running
+  image already ships a Playwright whose version differs from the agents' pin —
+  turning what was a silent runtime mismatch (browser dir present but built by
+  the wrong driver) into a loud, instructed sync-time error. True multi-version
+  coexistence under one `PLAYWRIGHT_BROWSERS_PATH` is deferred until a real
+  deployment actually needs two versions at once; the end-to-end "launch
+  Chromium, produce a PDF" smoke test is still worth running once on a real
+  Playwright agent, but no longer blocks the design.
 - **Deferred (D2): `uv.lock`/`poetry.lock`/`Pipfile.lock` → pinned-requirements
   export** — add only if an agent's toolchain makes producing a pinned
   `requirements.txt` painful.

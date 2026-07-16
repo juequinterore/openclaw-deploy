@@ -223,6 +223,30 @@ install_skill_deps() {
   done < <(find "$dst" -type f -name package.json -not -path '*/node_modules/*' -print0)
 }
 
+# Is a requirements file fully pinned (every requirement fixed to one version)?
+# Returns 0 if so, 1 otherwise (AGENTS-DEPS-SPEC.md §3.2). A line is "pinned
+# enough" when it is a comment/blank, an option/hash/continuation line (starts
+# with '-', e.g. '--hash=', '-e', '--index-url'), carries a '==' version pin, or
+# is a direct URL/VCS reference ('pkg @ https://…', 'git+https://…@sha') — those
+# last two ARE exact pins. Only a bare or range-specified requirement
+# ('requests', 'requests>=2') makes the file unpinned. This deliberately accepts
+# `pip-compile --generate-hashes` output, env markers, and URL refs, which an
+# older "'==' on every non-comment line" check wrongly rejected.
+lock_is_fully_pinned() {
+  local f="$1" line stripped
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    stripped="${line%%#*}"                                # drop inline comment
+    stripped="${stripped#"${stripped%%[![:space:]]*}"}"    # ltrim
+    stripped="${stripped%"${stripped##*[![:space:]]}"}"    # rtrim
+    [[ -z "$stripped" ]] && continue                       # blank / comment-only
+    [[ "$stripped" == -* ]] && continue                    # option / --hash / continuation
+    [[ "$stripped" == *"=="* ]] && continue                # version pin
+    [[ "$stripped" == *"@"* ]] && continue                 # direct URL / VCS ref = exact pin
+    return 1                                                # bare/range requirement → not pinned
+  done < "$f"
+  return 0
+}
+
 # Install a materialized agent's Python runtime dependencies
 # (AGENTS-DEPS-SPEC.md §3), symmetric with install_skill_deps above but into
 # ONE per-agent site: <workspace>/.python-site. The base image's constant
@@ -233,16 +257,26 @@ install_skill_deps() {
 # in-image, after copy and before the Linux chown, so wheels are Linux-native
 # and end up uid-1000-owned like the rest of the workspace.
 #
-# Sets the global PY_PLAYWRIGHT_LOCKLINE[$id] (an associative array declared
-# by the caller) to the exact pinned `playwright==X.Y.Z` line if any resolved
-# lock pins it — used by the OS-dep preflight step to auto-derive
-# playwrightBrowsers (§6.2) and to version-match the base image's browser
-# install.
+# A pinned lock (requirements.lock, or a fully-pinned requirements.txt) is
+# PREFERRED but no longer required (§3.2): when present, the full set installs
+# with the resolver OFF (`--no-deps`), byte-reproducible; when absent, the
+# DECLARED deps install with the resolver ON and a loud warning that the result
+# is not reproducible across hosts/time. The supply-chain gate
+# (`--only-binary=:all:`) applies to both and lifts only under
+# `allowInstallScripts`.
+#
+# Sets the global PY_PLAYWRIGHT_LOCKLINE[$id] (an associative array declared by
+# the caller) when playwright is a dep: to the exact `playwright==X.Y.Z` spec
+# when a pinned lock gives one, else to a bare `playwright`. The OS-dep preflight
+# uses it to auto-derive playwrightBrowsers (§6.2) and to version-match the base
+# image's browser install.
 install_python_deps() {
   local id="$1" dst="$2" allow_scripts="$3"
   [[ -d "$dst" ]] || return 0
 
-  local -a lock_container_paths=()
+  local -a lock_container_paths=()   # roots shipping a pinned lock (reproducible, --no-deps)
+  local -a unpinned_specs=()         # declared deps for roots with NO lock (resolver runs)
+  local -a unpinned_roots=()         # rel paths of those roots, for the warning
   local f d rel container_dir
   local -A seen_dirs=()
 
@@ -305,47 +339,95 @@ $pj_err_text"
 
     [[ ${#req_lines[@]} -eq 0 ]] && continue   # nothing to install from this root
 
-    # --- resolve a fully '=='-pinned lock (D2 — requirements.lock, else a
-    # fully pinned requirements.txt; no other lock format in v1, §3.2) ---
+    # Detect a playwright dependency (pinned or not) for OS-dep auto-derivation
+    # (§6.2); a pinned lock line below refines this to the exact version. A
+    # package name runs [a-z0-9._-], so any other char ends "playwright".
+    local rl rll
+    for rl in "${req_lines[@]}"; do
+      rll="${rl,,}"
+      if [[ "$rll" == playwright || "$rll" == playwright[^a-z0-9._-]* ]]; then
+        PY_PLAYWRIGHT_LOCKLINE["$id"]="${PY_PLAYWRIGHT_LOCKLINE[$id]:-playwright}"
+        break
+      fi
+    done
+
+    # --- resolve a pinned lock if this root ships one (A: the heuristic now
+    # accepts pip-compile --generate-hashes, URL/VCS refs, and env markers —
+    # §3.2). No lock is no longer fatal (B): fall back to resolver-on install. ---
     local lock_file=""
-    if [[ -f "$d/requirements.lock" ]] && ! grep -Ev '^[[:space:]]*(#.*)?$' "$d/requirements.lock" | grep -qv '=='; then
+    if [[ -f "$d/requirements.lock" ]] && lock_is_fully_pinned "$d/requirements.lock"; then
       lock_file="$d/requirements.lock"
-    elif [[ -f "$d/requirements.txt" ]] && ! grep -Ev '^[[:space:]]*(#.*)?$' "$d/requirements.txt" | grep -qv '=='; then
+    elif [[ -f "$d/requirements.txt" ]] && lock_is_fully_pinned "$d/requirements.txt"; then
       lock_file="$d/requirements.txt"
     fi
-    if [[ -z "$lock_file" ]]; then
-      fail "$id: ${rel} declares Python dependencies but ships no fully '=='-pinned lock — commit requirements.lock (or a fully pinned requirements.txt), e.g. via 'uv pip compile', 'pip-compile', or 'pip freeze'."
+
+    if [[ -n "$lock_file" ]]; then
+      local pw_line
+      pw_line=$(grep -iE '^playwright[[:space:]]*==' "$lock_file" | head -1 || true)
+      if [[ -n "$pw_line" ]]; then
+        pw_line="${pw_line%%;*}"                    # drop env marker, if any
+        pw_line="${pw_line%%[[:space:]]*}"          # first token: drops trailing ' \', comment
+        PY_PLAYWRIGHT_LOCKLINE["$id"]="$pw_line"
+      fi
+      local lock_rel="${lock_file#"$d/"}"
+      lock_container_paths+=("$container_dir/$lock_rel")
+    else
+      # B: no pinned lock — install the DECLARED requirements with the resolver
+      # ON. These are requirement SPECIFIERS (not container paths), passed as
+      # positional args, so no host↔container path mapping is needed.
+      unpinned_specs+=("${req_lines[@]}")
+      unpinned_roots+=("$rel")
     fi
-
-    local pw_line
-    pw_line=$(grep -iE '^playwright([=<>! ].*)?$' "$lock_file" | head -1 || true)
-    [[ -n "$pw_line" ]] && PY_PLAYWRIGHT_LOCKLINE["$id"]="$pw_line"
-
-    local lock_rel="${lock_file#"$d/"}"
-    lock_container_paths+=("$container_dir/$lock_rel")
   done < <(find "$dst" \( -name pyproject.toml -o -name 'requirements*.txt' \) -type f \
              -not -path '*/node_modules/*' -not -path '*/.python-site/*' -print0)
 
-  [[ ${#lock_container_paths[@]} -eq 0 ]] && return 0
+  [[ ${#lock_container_paths[@]} -eq 0 && ${#unpinned_specs[@]} -eq 0 ]] && return 0
 
   local site_container="/home/node/.openclaw/agents/$id/workspace/.python-site"
   rm -rf "$dst/.python-site"   # wiped + reinstalled every sync — same idempotency as node_modules
 
   local bin_flag="--only-binary=:all:"
-  if [[ "$allow_scripts" == "true" ]]; then
-    log "    pip install (sdists ALLOWED): $id"
-    bin_flag=""
-  else
-    log "    pip install --only-binary=:all:: $id"
+  [[ "$allow_scripts" == "true" ]] && bin_flag=""
+  local scripts_note=""
+  [[ -z "$bin_flag" ]] && scripts_note=", sdists ALLOWED"
+
+  # Pass 1 — pinned locks: resolver OFF, byte-reproducible (§3.3).
+  if [[ ${#lock_container_paths[@]} -gt 0 ]]; then
+    log "    pip install (pinned lock${scripts_note}): $id"
+    local -a pip_args=(-m pip install --target "$site_container" --no-deps --no-input)
+    [[ -n "$bin_flag" ]] && pip_args+=("$bin_flag")
+    local p
+    for p in "${lock_container_paths[@]}"; do pip_args+=(-r "$p"); done
+    docker compose run -T --rm --entrypoint python3 openclaw-cli "${pip_args[@]}" \
+      || fail "pip install failed for $id (pinned lock) — see output above."
   fi
 
-  local -a pip_args=(-m pip install --target "$site_container" --no-deps --no-input)
-  [[ -n "$bin_flag" ]] && pip_args+=("$bin_flag")
-  local p
-  for p in "${lock_container_paths[@]}"; do pip_args+=(-r "$p"); done
+  # Pass 2 — unpinned declared deps: resolver ON, NOT reproducible (§3.2, D2).
+  if [[ ${#unpinned_specs[@]} -gt 0 ]]; then
+    warn "$id: no pinned lock for [${unpinned_roots[*]}] — resolving declared Python deps at sync time (resolver ON). Installs are NOT byte-reproducible across hosts/time; commit a requirements.lock (or fully pinned requirements.txt) via 'uv pip compile' / 'pip-compile' / 'pip freeze' to make them so."
+    log "    pip install (unpinned, resolver ON${scripts_note}): $id"
+    local -a pip_args2=(-m pip install --target "$site_container" --no-input)
+    [[ -n "$bin_flag" ]] && pip_args2+=("$bin_flag")
+    pip_args2+=("${unpinned_specs[@]}")
+    docker compose run -T --rm --entrypoint python3 openclaw-cli "${pip_args2[@]}" \
+      || fail "pip install failed for $id (unpinned) — see output above."
+  fi
 
-  docker compose run -T --rm --entrypoint python3 openclaw-cli "${pip_args[@]}" \
-    || fail "pip install failed for $id — see output above."
+  # If playwright is a dep but we only knew it by name (no pinned lock gave a
+  # version), pin PY_PLAYWRIGHT_LOCKLINE to the version pip actually RESOLVED
+  # into the site — read back from its dist-info on the (bind-mounted) host.
+  # Without this the OS-dep preflight would emit an unpinned `playwright` and
+  # skip the version-coupling guard (§6.2), risking an image browser build that
+  # doesn't match the per-agent pip package.
+  if [[ -n "${PY_PLAYWRIGHT_LOCKLINE[$id]:-}" && "${PY_PLAYWRIGHT_LOCKLINE[$id]}" != *"=="* ]]; then
+    local pw_di pw_ver
+    for pw_di in "$dst"/.python-site/playwright-*.dist-info; do
+      [[ -d "$pw_di" ]] || continue
+      pw_ver="$(basename "$pw_di")"; pw_ver="${pw_ver#playwright-}"; pw_ver="${pw_ver%.dist-info}"
+      [[ -n "$pw_ver" ]] && PY_PLAYWRIGHT_LOCKLINE["$id"]="playwright==$pw_ver"
+      break
+    done
+  fi
 }
 
 # --- 1. preflight --------------------------------------------------------
@@ -577,6 +659,47 @@ for row in "${EFF_ROWS[@]}"; do
   fi
 done
 
+# --- Playwright version policy: ONE version per box (AGENTS-DEPS-SPEC.md §6.2,
+# §12). Multiple agents may use Playwright, but they must agree on the pinned
+# version: the browser build + OS libs are a single shared image layer, and
+# coexisting driver versions under one PLAYWRIGHT_BROWSERS_PATH is not yet
+# confirmed. And if the running image already ships a DIFFERENT playwright than
+# the agents pin, the per-agent pip package would silently mismatch the
+# installed browser build — catch it here (the browser-presence check below is
+# version-blind on its own). Only agents with a PINNED playwright constrain the
+# box; an unpinned one just triggers browser auto-derivation.
+REQUIRED_PW_VERSION=""
+if [[ ${#NEEDED_PW[@]} -gt 0 ]]; then
+  declare -A PW_VERSIONS=()   # distinct pinned "X.Y.Z" -> comma-joined ids
+  for row in "${EFF_ROWS[@]}"; do
+    [[ -z "$row" ]] && continue
+    id=$(jq -r '.id' <<<"$row")
+    pw_ln="${PY_PLAYWRIGHT_LOCKLINE[$id]:-}"
+    [[ "$pw_ln" == *"=="* ]] || continue
+    pw_ver="${pw_ln#*==}"
+    PW_VERSIONS["$pw_ver"]="${PW_VERSIONS[$pw_ver]:+${PW_VERSIONS[$pw_ver]},}$id"
+  done
+  if [[ ${#PW_VERSIONS[@]} -gt 1 ]]; then
+    echo "Conflicting pinned Playwright versions across agents — one version per box (§6.2/§12):" >&2
+    for pw_ver in "${!PW_VERSIONS[@]}"; do echo "  - playwright==$pw_ver  (${PW_VERSIONS[$pw_ver]})" >&2; done
+    fail "Align every Playwright-using agent on a single pinned version, then re-run. Nothing has been changed yet."
+  fi
+  for pw_ver in "${!PW_VERSIONS[@]}"; do REQUIRED_PW_VERSION="$pw_ver"; done
+  if [[ -n "$REQUIRED_PW_VERSION" ]]; then
+    IMAGE_PW_VERSION=$(docker compose run -T --rm --entrypoint python3 openclaw-cli \
+      -m playwright --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 || true)
+    if [[ -n "$IMAGE_PW_VERSION" && "$IMAGE_PW_VERSION" != "$REQUIRED_PW_VERSION" ]]; then
+      echo >&2
+      echo "The running image has playwright $IMAGE_PW_VERSION, but plugged-in agents pin" >&2
+      echo "playwright==$REQUIRED_PW_VERSION (needed by: ${NEEDED_PW[chromium]:-Playwright-using agents})." >&2
+      echo "The per-agent pip package and the image's browser build must match. Update the existing" >&2
+      echo "'pip install ... \"playwright==...\"' line in the base Dockerfile to playwright==$REQUIRED_PW_VERSION, then rebuild:" >&2
+      echo >&2
+      fail "docker compose build && docker compose up -d openclaw-gateway, then re-run ./setup.sh --sync-agents. Nothing has been changed yet (validate-and-instruct — §6.3)."
+    fi
+  fi
+fi
+
 MISSING_OS=0
 DOCKERFILE_SNIPPET=""
 for pkg in "${!NEEDED_APT[@]}"; do
@@ -588,12 +711,10 @@ for pkg in "${!NEEDED_APT[@]}"; do
   fi
 done
 for browser in "${!NEEDED_PW[@]}"; do
-  # Best-effort presence check only (a browser dir exists under
-  # PLAYWRIGHT_BROWSERS_PATH) — it does NOT confirm the installed build
-  # matches every requesting agent's pinned Playwright version. Confirming
-  # that end to end is flagged as a to-confirm-during-implementation item
-  # (AGENTS-DEPS-SPEC.md §12); if it proves fussy across mixed versions, the
-  # documented fallback is one Playwright version per box.
+  # Presence check (a browser dir exists under PLAYWRIGHT_BROWSERS_PATH). The
+  # pinned-version match is enforced separately above (the one-version-per-box
+  # policy + image-vs-required comparison, AGENTS-DEPS-SPEC.md §6.2/§12); this
+  # loop only confirms the browser build itself is present.
   if ! docker compose run -T --rm --entrypoint sh openclaw-cli -c \
       "find \"\${PLAYWRIGHT_BROWSERS_PATH:-/opt/ms-playwright}\" -maxdepth 1 -iname '${browser}-*' 2>/dev/null | grep -q ." \
       >/dev/null 2>&1; then

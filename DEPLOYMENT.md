@@ -824,11 +824,15 @@ dependency-free) agent like `echo-bot`.
    §3.4/§5), FROM the same pinned upstream tag this repo already tracks. Keep
    the `Dockerfile`'s `FROM` tag and this `OPENCLAW_IMAGE` value in sync when
    you bump versions (same ritual as "Updating the image version" above).
-2. **Ship the agent's Python deps as a fully `==`-pinned lock** —
+2. **Ship a fully `==`-pinned lock if you want reproducible installs** —
    `requirements.lock`, or a `requirements.txt` that's itself the output of
-   `pip freeze` / `pip-compile` / `uv pip compile`. An unpinned
-   `requirements.txt` with no accompanying lock fails the sync loudly, same as
-   a missing `package-lock.json` does for npm.
+   `pip freeze` / `pip-compile` / `uv pip compile`. This is recommended but no
+   longer required (revised 2026-07-16): an agent that ships only a
+   `pyproject.toml` with version ranges (or an unpinned `requirements.txt`) now
+   syncs anyway — the sync resolves its declared deps and **warns** that the
+   install isn't byte-reproducible across hosts/time, rather than failing.
+   (npm still requires its `package-lock.json`; see `AGENTS-DEPS-SPEC.md` §3.2
+   for why Python differs.)
 3. **Sync as usual** (`./setup.sh --sync-agents`) — it installs each agent's
    deps into its own `<workspace>/.python-site` (never a shared/merged
    install; two agents can pin conflicting versions with no collision).
