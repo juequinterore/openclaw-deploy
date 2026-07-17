@@ -83,8 +83,37 @@ docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
 docker compose run --rm -it openclaw-cli chat
 ```
 
-Or opt into the dashboard (Control UI) for point-and-click testing — see
-"Validating the coordinator" in DEPLOYMENT.md.
+### Dashboard (Control UI) — point-and-click testing
+
+Off by default: the gateway binds to loopback with no published port. To
+turn it on:
+
+```bash
+# macOS sed shown; on Linux drop the '' after -i
+sed -i '' 's/^OPENCLAW_GATEWAY_BIND=.*/OPENCLAW_GATEWAY_BIND=lan/' .env
+grep -q docker-compose.dashboard.yml .env || \
+  sed -i '' 's|^COMPOSE_FILE=.*|&:docker-compose.dashboard.yml|' .env
+docker compose up -d openclaw-gateway     # up -d, not restart
+```
+
+Then browse **`http://127.0.0.1:18789/`** — auth token is
+`OPENCLAW_GATEWAY_TOKEN` from `.env`. This publishes to the **host loopback
+only** (not `0.0.0.0`); on a remote host, don't change that — instead tunnel
+in with `ssh -N -L 18789:127.0.0.1:18789 user@host` and browse the same
+`127.0.0.1:18789` URL locally.
+
+Chatting with `main` here exercises real delegation (unlike the local `chat`
+command above) — this is the easiest way to see the coordinator route to
+echo-bot/sallie/virginia end to end.
+
+**Revert** when done — this is an admin surface (chat, config, exec
+approvals) and shouldn't stay enabled by default:
+
+```bash
+sed -i '' 's/:docker-compose\.dashboard\.yml//' .env
+sed -i '' 's/^OPENCLAW_GATEWAY_BIND=.*/OPENCLAW_GATEWAY_BIND=loopback/' .env
+docker compose up -d openclaw-gateway
+```
 
 ## Repo map
 
