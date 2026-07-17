@@ -54,6 +54,8 @@
     // sync will abort with the exact Dockerfile lines to append (chromium is a
     // root/apt image layer, never installed into a workspace).
     { source: "git@bitbucket.org:57blocks/onepagerbuilder.git",
-      ref: "chore/openclaw-deploy-compat" },
+      ref: "chore/openclaw-deploy-compat" ,
+      timeoutMs: 600000,
+      },
   ],
 }

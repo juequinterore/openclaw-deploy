@@ -83,9 +83,20 @@ for var in OPENCLAW_IMAGE OPENCLAW_CONFIG_DIR OPENCLAW_WORKSPACE_DIR \
   grep -qE "^${var}=.+" .env || fail "$var is not set in .env. Edit it manually (see .env.example), then re-run this script."
 done
 
-# --- 2. Pull image -------------------------------------------------------
-log "Pulling pinned OpenClaw image"
-docker compose pull openclaw-gateway
+# --- 2. Get the image ----------------------------------------------------
+# OPENCLAW_IMAGE is either a real published tag (pull it) or a locally-built
+# one, e.g. this repo's own Dockerfile adding Python/Playwright for plugged-in
+# agents (DEPLOYMENT.md "Python & OS-level agent dependencies") — nothing to
+# pull for that case, so fall back to building it from the committed
+# Dockerfile. This keeps the fast path for a stock deployment while making a
+# local-image deployment reproducible on any machine, not just the one it was
+# first built on.
+log "Fetching the OpenClaw image"
+if ! docker compose pull openclaw-gateway; then
+  log "Pull failed — falling back to building locally from the committed Dockerfile (expected if OPENCLAW_IMAGE is a local-only tag, not a published one)"
+  docker compose build openclaw-gateway ||
+    fail "Could not pull or build the OpenClaw image. Check OPENCLAW_IMAGE in .env, your network connection, and (if building) the Dockerfile."
+fi
 IMAGE_RESOLVED=$(docker compose config 2>/dev/null | grep -m1 'image:' | awk '{print $2}')
 [[ "$IMAGE_RESOLVED" != "openclaw:local" ]] || fail "OPENCLAW_IMAGE still resolves to openclaw:local — check .env."
 
