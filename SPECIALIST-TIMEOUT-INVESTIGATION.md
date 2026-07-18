@@ -1,10 +1,22 @@
 # Long-Running Specialist "False Timeout" — Investigation & Findings
 
-**Status: root cause confirmed, workaround verified end-to-end, not yet wired
-into the coordinator persona.** This document records what was tested, what
-was ruled out, and what was proven to work — so the fix can be implemented
-later without re-running this investigation, and so anyone hitting the same
-symptom doesn't waste time on the dead ends already ruled out here.
+**Status: FIXED (2026-07-17).** The final implementation uses requester-aware
+native subagents: `sessions_spawn` starts the specialist,
+`message` posts the working acknowledgement to the source conversation, and
+`sessions_yield` leaves the coordinator subscribed to the child's completion
+event. The gateway then wakes `main` and delivers its completed-result reply
+to the recorded Discord/Slack/etc. origin. The sync-owned config patch also
+raises the `claude-cli` resumed-session no-output watchdog from 60s to 180s as
+defense-in-depth.
+
+An intermediate dispatch-then-poll implementation is documented below because
+it fixed the coordinator crash, but its claimed proactive-delivery extension
+was wrong. Live Discord testing proved that `sessions_send`'s later
+`mode:"announce"` delivery resolves the **target specialist session**
+(`agent:virginia:main`, internal `webchat`), not the Discord session that
+requested the work. `main` is never woken, so granting it `message` cannot
+deliver anything. That is why the final fix replaces the dispatch primitive
+rather than adding another poller.
 
 Referenced briefly in [README.md](./README.md)'s "Known limitations" — this
 is the full writeup.

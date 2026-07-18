@@ -25,11 +25,11 @@ for arg in "$@"; do
       echo "NOTE: --agents is deprecated, use --sync-agents instead (it now syncs" >&2
       echo "      agents.manifest.json5, not a hardcoded echo-bot scaffold — the default" >&2
       echo "      manifest still points at the same echo-bot demo, so this keeps working," >&2
-      echo "      but tools.agentToAgent.allow and maxPingPongTurns get tighter defaults." >&2
+      echo "      but coordinator delegation now uses requester-aware native subagents." >&2
       echo "      See \"Single point of contact\" in DEPLOYMENT.md." >&2
       ;;
     -h|--help)
-      printf 'Usage: ./setup.sh [--sync-agents [--prune]]\n\n  --sync-agents  After the base setup, sync the agents declared in\n                 agents.manifest.json5 into the running gateway, behind a\n                 coordinator (sessions_send + tools.agentToAgent). Idempotent.\n                 See AGENTS-PLUGINS.md and "Single point of contact" in\n                 DEPLOYMENT.md.\n  --prune        With --sync-agents: confirm removal of agents.list entries\n                 that are neither the coordinator nor produced by the\n                 manifest (otherwise the sync aborts and lists them).\n  --agents       Deprecated alias for --sync-agents.\n'
+      printf 'Usage: ./setup.sh [--sync-agents [--prune]]\n\n  --sync-agents  After the base setup, sync the agents declared in\n                 agents.manifest.json5 into the running gateway, behind a\n                 coordinator (sessions_spawn + requester-bound completion).\n                 Idempotent. See AGENTS-PLUGINS.md and "Single point of\n                 contact" in DEPLOYMENT.md.\n  --prune        With --sync-agents: confirm removal of agents.list entries\n                 that are neither the coordinator nor produced by the\n                 manifest (otherwise the sync aborts and lists them).\n  --agents       Deprecated alias for --sync-agents.\n'
       exit 0 ;;
     *) fail "Unknown argument: $arg (try --help)" ;;
   esac
@@ -104,11 +104,14 @@ IMAGE_RESOLVED=$(docker compose config 2>/dev/null | grep -m1 'image:' | awk '{p
 log "Creating data directories"
 mkdir -p .openclaw-data/config .openclaw-data/workspace .openclaw-data/auth-secrets
 if [[ "$(uname -s)" == "Linux" ]]; then
-  log "Linux detected: chowning data dirs to uid 1000 (the container's node user)"
-  if [[ "$(id -u)" -eq 0 ]]; then
-    chown -R 1000:1000 .openclaw-data
-  else
-    sudo chown -R 1000:1000 .openclaw-data
+  # Skip the chown (and its sudo prompt) when ownership is already right —
+  if [[ -n "$(find .openclaw-data ! \( -uid 1000 -gid 1000 \) -print -quit)" ]]; then
+    log "Linux detected: chowning data dirs to uid 1000 (the container's node user)"
+    if [[ "$(id -u)" -eq 0 ]]; then
+      chown -R 1000:1000 .openclaw-data
+    else
+      sudo chown -R 1000:1000 .openclaw-data
+    fi
   fi
 fi
 
@@ -171,9 +174,9 @@ docker compose run --rm --no-deps --entrypoint node openclaw-gateway \
   --non-interactive --accept-risk --auth-choice anthropic-cli \
   --gateway-bind loopback --skip-channels --skip-skills --skip-hooks --skip-search --skip-health
 
-log "Setting default model to anthropic/claude-sonnet-4-6"
+log "Setting default model to anthropic/claude-sonnet-5"
 docker compose run --rm openclaw-cli config set \
-  agents.defaults.model.primary anthropic/claude-sonnet-4-6
+  agents.defaults.model.primary anthropic/claude-sonnet-5
 
 # Pin the FULL claude-cli backend. Setting only `.command` leaves the backend
 # without its `args`, so agents launch with no `--allowedTools mcp__openclaw__*`

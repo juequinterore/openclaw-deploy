@@ -17,7 +17,7 @@
 # The FROM tag below must track this deployment's own `OPENCLAW_IMAGE` pin in
 # .env.example — bump both together (see docker-compose.yml's "Updating the
 # image version" ritual in DEPLOYMENT.md).
-FROM ghcr.io/openclaw/openclaw:2026.6.11
+FROM ghcr.io/openclaw/openclaw:2026.7.1
 
 USER root
 RUN apt-get update \
