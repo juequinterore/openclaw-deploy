@@ -64,7 +64,7 @@
     // root/apt image layer, never installed into a workspace).
     { source: "git@bitbucket.org:57blocks/onepagerbuilder.git",
       ref: "feature/email_sub_agent",
-      timeoutMs: 1500000,  // 25-minute execution budget; full research + rendering can exceed the previous 15-minute limit
+      timeoutMs: 1500000,  // 25-minute safety ceiling; typical full research + rendering runs take 6-15 minutes
       // The gateway's default thinking=adaptive let sonnet burn two ~30K-token
       // extended-thinking blocks (~17 min of wall-clock) authoring one brief
       // (measured live, StudyFetch 2026-07-17). Her workflow is script-driven;
@@ -77,7 +77,7 @@
       // Appended verbatim to every task dispatched to virginia. It both forces
       // the complete workflow and stages all user-facing files under main's
       // media-allowed workspace so Discord/Slack can attach them.
-      taskHint: "Run your complete one-pager workflow. The required user-facing deliverables are the rendered PDF, the editable .editor.html, and outputs/<slug>/cold-email.md; a text-only summary is not finished. Before your final reply, copy those three files into /home/node/.openclaw/workspace/deliveries/<slug>/<render-stamp>/ using the actual slug and render stamp. Include the three copied absolute paths as separate plain MEDIA: lines and name all three files in your reply. Do not attach the plain intermediate .html.",
+      taskHint: "Work ONLY on the company named in this task: never resume, complete, or deliver another company's artifacts, even if outputs/ contains in-progress work from other jobs (concurrent or interrupted runs leave such state; it is not yours). Run your complete one-pager workflow. The required user-facing deliverables are the rendered PDF, the editable .editor.html, and outputs/<slug>/cold-email.md; a text-only summary is not finished. Before your final reply, copy those three files into /home/node/.openclaw/workspace/deliveries/<slug>/<render-stamp>/ using the actual slug and render stamp. Include the three copied absolute paths as separate plain MEDIA: lines and name all three files in your reply. Do not attach the plain intermediate .html.",
       },
   ],
 }

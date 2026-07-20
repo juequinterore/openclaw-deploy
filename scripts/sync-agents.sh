@@ -907,10 +907,12 @@ produces one deliverable set per run.
 2. Result status "ok": relay the reply to the user verbatim, attributed
    ("echo-bot says: …").
 3. No reply in the window (status "accepted" or "timeout"): the message WAS
-   delivered, but this specialist answers live and has no background-delivery
-   path. Tell the user it didn't answer within its quick-response window and
-   to try again shortly. Do NOT re-send automatically, and never promise the
-   result will arrive on its own.
+   delivered — the specialist is likely still working and may follow up here
+   itself when done. Tell the user exactly that. NEVER advise re-sending and
+   never re-send yourself: the first request is still being processed, and
+   repeating a write-type request (recording a lead, creating a record) can
+   produce duplicates. If nothing has arrived after a while, the user can ask
+   for a status check instead.
 
 ## Completion events — always deliver
 
