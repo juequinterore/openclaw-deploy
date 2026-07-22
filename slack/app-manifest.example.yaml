@@ -31,12 +31,14 @@ features:
     # compose box shows "Sending messages to this app has been turned off."
     messages_tab_read_only_enabled: false
 
-  # --- OPTIONAL: Slack "AI Assistant" surface -------------------------------
-  # Adds the Assistant side panel + "New chat" button. Requires the matching
-  # `assistant:write` scope below AND code that handles
-  # assistant_thread_started / assistant_thread_context_changed events -- it's
-  # a different integration surface, not just cosmetic. Delete this whole
-  # block for a plain conversational bot (no Assistant UI).
+  # --- OPTIONAL: Slack "AI Assistant" surface (OFF by default) --------------
+  # Adds the Assistant side panel + "New chat" button. Uncomment the
+  # `assistant_view` block below AND the matching `assistant:write` scope to
+  # turn it on -- but ONLY if the runtime handles the assistant flow (see
+  # below), otherwise the panel opens a conversation the bot never
+  # acknowledges. It is a different integration surface, not just cosmetic, so
+  # it ships disabled: a plain conversational bot (Messages tab DM/mention
+  # flow) needs none of it.
   #
   # DEPRECATION NOTICE (per https://docs.slack.dev/ai/developing-agents/#migrating):
   # Slack is deprecating assistant_view in favor of "agent_view" (the Agent
@@ -47,11 +49,11 @@ features:
   # with an app_home_opened handler that checks event.tab === "messages".
   # Either way, this is NOT cosmetic-only: verify the gateway/runtime you're
   # deploying actually implements the relevant event handlers before enabling
-  # this block, or the button/panel will open a conversation the bot never
-  # acknowledges.
-  assistant_view:
-    assistant_description: "One-line description shown in the assistant panel"
-    suggested_prompts: []
+  # this block. The openclaw gateway image this template deploys does not
+  # confirm supporting either surface, so it is left out by default.
+  # assistant_view:
+  #   assistant_description: "One-line description shown in the assistant panel"
+  #   suggested_prompts: []
 
 oauth_config:
   scopes:

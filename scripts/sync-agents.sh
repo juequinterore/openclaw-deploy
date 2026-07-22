@@ -625,7 +625,8 @@ for row in "${EFF_ROWS[@]}"; do
 done
 
 if [[ "$(uname -s)" == "Linux" ]]; then
-  # Skip the chown (and its sudo prompt) when ownership is already right —
+  # Skip the chown (and its sudo prompt) when ownership is already right: only
+  # run it if some path under agents/ is not already owned by uid/gid 1000.
   if [[ -n "$(find "$CONFIG_DIR/agents" ! \( -uid 1000 -gid 1000 \) -print -quit)" ]]; then
     log "Linux detected: chowning materialized workspaces to uid 1000"
     if [[ "$(id -u)" -eq 0 ]]; then chown -R 1000:1000 "$CONFIG_DIR/agents"
@@ -994,7 +995,8 @@ MD
 } > "$WORKSPACE_DIR/AGENTS.md"
 
 if [[ "$(uname -s)" == "Linux" ]]; then
-  # Skip the chown (and its sudo prompt) when ownership is already right —
+  # Skip the chown (and its sudo prompt) when ownership is already right: only
+  # run it if some path under the workspace is not already owned by uid/gid 1000.
   if [[ -n "$(find "$WORKSPACE_DIR" ! \( -uid 1000 -gid 1000 \) -print -quit)" ]]; then
     if [[ "$(id -u)" -eq 0 ]]; then chown -R 1000:1000 "$WORKSPACE_DIR"
     else sudo chown -R 1000:1000 "$WORKSPACE_DIR"; fi
@@ -1075,8 +1077,11 @@ if [[ -n "$FIRST_ID" ]]; then
     --session-key "agent:$COORDINATOR_ID:$RUN_ID" --json --timeout 120 --message \
     "This is an automated sync verification of the background-dispatch plumbing, not a real request. For this check only, dispatch to the '$FIRST_ID' specialist using sessions_spawn (runtime=\"subagent\", mode=\"run\", cleanup=\"keep\") regardless of its dispatch mode, and do not append any dispatch requirements. The task for the specialist is: Reply with exactly: RELAY_OK $TOKEN" \
     2>&1) || true
-  # OpenClaw (2026.6.11 wrote it as a user message; 2026.7.1 feeds it through the protected runtime-context
-  # block, so it never appears). 
+  # We prove delivery by scanning transcripts, not by matching the token in
+  # $CR (the coordinator's captured turn output): how the completion result
+  # surfaces changed across images (2026.6.11 wrote it as a user message;
+  # 2026.7.1 feeds it through the protected runtime-context block, so it never
+  # appears in the turn output), so $CR is not a reliable delivery signal.
   RELAY_PROOF=""
   for _ in $(seq 1 30); do
     if grep -rlq "RELAY_OK $TOKEN" "$CONFIG_DIR/agents/$FIRST_ID/sessions/" 2>/dev/null; then

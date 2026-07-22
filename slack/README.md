@@ -45,14 +45,17 @@ reusing one manifest/app across deployments.
 
 The `features.assistant_view` block (paired with the `assistant:write` scope)
 turns on Slack's AI Assistant panel — the "New chat" button, suggested
-prompts, dedicated sidebar. This is a genuinely different integration surface,
-not a cosmetic toggle: the app starts receiving `assistant_thread_started` /
-`assistant_thread_context_changed` events and is expected to respond via the
-Assistant API (`assistant.threads.setStatus`,
-`assistant.threads.setSuggestedPrompts`, etc.), not just plain
-`message.im`/`app_mention` replies. Only include it if the agent's code
-actually handles that flow — otherwise the button opens a thread the bot
-never acknowledges. Delete the block entirely for a plain conversational bot.
+prompts, dedicated sidebar. It ships **commented out** in the template: it is a
+genuinely different integration surface, not a cosmetic toggle. The app starts
+receiving `assistant_thread_started` / `assistant_thread_context_changed`
+events and is expected to respond via the Assistant API
+(`assistant.threads.setStatus`, `assistant.threads.setSuggestedPrompts`, etc.),
+not just plain `message.im`/`app_mention` replies. Only uncomment it (plus the
+`assistant:write` scope) if the agent's code actually handles that flow —
+otherwise the button opens a thread the bot never acknowledges. Note also that
+Slack is deprecating `assistant_view` in favor of `agent_view`; the template
+comment tracks the migration details. Leave it commented for a plain
+conversational bot.
 
 ## Socket Mode
 

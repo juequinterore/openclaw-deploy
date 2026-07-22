@@ -1,13 +1,18 @@
 # Long-Running Specialist "False Timeout" — Investigation & Findings
 
 **Status: FIXED (2026-07-17).** The final implementation uses requester-aware
-native subagents: `sessions_spawn` starts the specialist,
-`message` posts the working acknowledgement to the source conversation, and
-`sessions_yield` leaves the coordinator subscribed to the child's completion
-event. The gateway then wakes `main` and delivers its completed-result reply
-to the recorded Discord/Slack/etc. origin. The sync-owned config patch also
-raises the `claude-cli` resumed-session no-output watchdog from 60s to 180s as
-defense-in-depth.
+native subagents: `sessions_spawn` starts the specialist and the coordinator
+ends that turn with a one-sentence acknowledgement — it does **not** call any
+waiting or yielding tool. The spawn itself registers the requester's
+Discord/Slack/etc. origin, so the child's completion event is delivered back to
+`main` on its own, on a later turn. On that completion turn `main` relays the
+real child result to the source conversation via the `message` tool and ends
+with `NO_REPLY`. (`sessions_yield` was tried and rejected: on sonnet-5 the model
+treated it as "wait silently" and ended the dispatch turn with `NO_REPLY`,
+suppressing the user-facing acknowledgement — so the coordinator is granted
+`sessions_spawn` + `message` but **not** `sessions_yield`.) The sync-owned
+config patch also raises the `claude-cli` resumed-session no-output watchdog
+from 60s to 180s as defense-in-depth.
 
 An intermediate dispatch-then-poll implementation is documented below because
 it fixed the coordinator crash, but its claimed proactive-delivery extension

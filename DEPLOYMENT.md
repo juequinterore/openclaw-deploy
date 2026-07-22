@@ -534,8 +534,9 @@ Native subagents are the coordinator's active delegation mechanism. A running
 agent starts an isolated child with `sessions_spawn`; OpenClaw records the
 requester's session and delivery origin, so completion can resume the parent
 and be pushed back to the same Discord/Slack/etc. conversation. The generated
-coordinator follows each accepted spawn with `sessions_yield`; there is no
-runtime polling loop.
+coordinator ends its dispatch turn with a brief acknowledgement and does not
+wait — the completion event arrives on its own from the spawn. There is no
+`sessions_yield` call and no runtime polling loop.
 
 Enable it on the agent that will spawn. Note `sessions_spawn` requires the
 `coding` or `full` tool profile — a `messaging`-profile agent has no spawn tool:
@@ -573,16 +574,22 @@ agent runs in one gateway, shares one Claude CLI login, and adds no
 infrastructure.
 
 **The mechanism:** `main` starts the selected configured agent through
-`sessions_spawn`, posts the working acknowledgement with the channel-agnostic
-`message` tool, then calls `sessions_yield`. The child completion event wakes
-`main`, and OpenClaw sends its normal completed-result reply to the requester
-origin registered at spawn time.
+`sessions_spawn` and ends the turn with a one-sentence acknowledgement — it
+never blocks or yields. The spawn registers the requester origin, so the child
+completion event wakes `main` on a later turn; `main` then relays the completed
+result to that origin with the channel-agnostic `message` tool and ends with
+`NO_REPLY`.
 
-> **Critical:** `main` needs capabilities from two profiles:
-> `sessions_spawn`/`sessions_yield` are coding tools while `message` is a
-> messaging tool. The sync uses `profile:"full"` and then narrows it with an
-> explicit five-tool allowlist. It also generates
-> `subagents.allowAgents` from the enabled manifest ids.
+> **Critical:** `main` needs capabilities from two profiles: `sessions_spawn`
+> is a coding tool while `message` is a messaging tool. The sync uses
+> `profile:"full"` and then narrows it with an explicit allowlist —
+> `sessions_list`, `sessions_history`, `sessions_spawn`, `message`, plus
+> `sessions_send` **only** when at least one enabled specialist uses
+> `dispatch:"send"` (the default manifest's `echo-bot` does, so its allowlist
+> has five tools; a spawn-only deployment has four). It also generates
+> `subagents.allowAgents` from the enabled manifest ids. `sessions_yield` is
+> deliberately excluded — on sonnet-5 the model treated it as "wait silently"
+> and suppressed the acknowledgement with `NO_REPLY`.
 
 ### Quickest path: `./setup.sh --sync-agents`
 
@@ -639,8 +646,11 @@ for the default manifest (one specialist, `echo-bot`):
       { id: "main", default: true,           // front door: unrouted messages land here
         tools: {
           profile: "full",
+          // sessions_send is added ONLY when a dispatch:"send" specialist
+          // exists (echo-bot is one in the default manifest); a spawn-only
+          // deployment drops it. sessions_yield is never granted.
           allow: ["sessions_list", "sessions_history", "sessions_spawn",
-                  "sessions_yield", "message"]
+                  "sessions_send", "message"]
         },
         subagents: {
           delegationMode: "prefer",
@@ -668,9 +678,13 @@ for the default manifest (one specialist, `echo-bot`):
 
 The sync-owned enabling keys, verified against `openclaw config schema`:
 
-- **`agents.list[main].tools` spans spawn/yield/message and is then narrowed** —
-  `profile:"full"` passes the profile filter for both coding and messaging
-  capabilities; the allowlist leaves only the coordinator tools.
+- **`agents.list[main].tools` spans spawn + message and is then narrowed** —
+  `profile:"full"` passes the profile filter for both coding (`sessions_spawn`)
+  and messaging (`message`) capabilities; the allowlist leaves only the
+  coordinator tools. `sessions_send` is appended only when a `dispatch:"send"`
+  specialist is enabled. `sessions_yield` is deliberately excluded — on sonnet-5
+  it lured the model into ending the dispatch turn with `NO_REPLY`, suppressing
+  the acknowledgement.
 - **`agents.list[main].subagents.allowAgents`** — explicit enabled specialist
   ids, never `"*"`.
 - **`agents.defaults.subagents.runTimeoutSeconds`** — largest enabled
@@ -719,12 +733,13 @@ on every sync going forward).
 2. `main` picks a specialist and calls `sessions_spawn(agentId="<id>",
    mode="run", task=request)`.
 3. The gateway registers the child with the requester session plus its
-   channel/account/target. `main` posts the working acknowledgement using
-   `message` and calls `sessions_yield`.
+   channel/account/target. `main` ends the turn with a one-sentence
+   acknowledgement — it does not yield or otherwise wait.
 4. The specialist runs in an isolated child session using its own configured
    workspace/persona/skills/model.
-5. The child completion event resumes `main`; `main` replies with the actual
-   child result, and the gateway delivers it to the registered requester.
+5. The child completion event resumes `main` on a later turn; `main` relays the
+   actual child result to the registered requester via the `message` tool and
+   ends with `NO_REPLY`.
 
 ### Validating the coordinator
 
@@ -952,7 +967,7 @@ See `docs.openclaw.ai/tools/subagents`.
   patch`, then `config validate` before restarting. Inspect the real schema any
   time with `docker compose run --rm openclaw-cli config schema`.
 - **Coordinator says `sessions_spawn` isn't available (only `sessions_list` /
-  `sessions_history` / `sessions_yield`)** — its tool profile doesn't include
+  `sessions_history`)** — its tool profile doesn't include
   the spawn tool. `sessions_spawn` is in the `coding`/`full` profiles only; a
   messaging/default-profile agent never gets it. Set
   `agents.list[main].tools.profile: "full"` and restart. Verify inside the TUI
@@ -973,9 +988,9 @@ See `docs.openclaw.ai/tools/subagents`.
   Start a fresh one: `docker compose run --rm -it openclaw-cli chat --session
   desk1`. If a brand-new provider conversation still won't delegate, force the
   tool to isolate the cause:
-  `Use sessions_spawn with agentId "echo-bot", then sessions_yield; ask it to
-  echo banana` — a child completion event means the plumbing works and the
-  remaining issue is persona/provider delivery.
+  `Use sessions_spawn with agentId "echo-bot" to run: echo banana` — a child
+  completion event means the plumbing works and the remaining issue is
+  persona/provider delivery.
 - **This repo has no application source, on purpose** — don't `git clone` the
   full `openclaw/openclaw` project expecting to find more here; everything
   needed to run is in this repo (the compose files plus your `.env`) alongside

@@ -25,7 +25,7 @@ your own agent, skip to **Adding your agent**.
    ────────────────▶│    main     │  coordinator — the only agent users talk to
    (one channel,     │ (coordinator)│
     one bot)         └──────┬──────┘
-                             │ sessions_spawn(agentId="<id>") + sessions_yield
+                             │ sessions_spawn(agentId="<id>") → completion event
                  ┌───────────┼───────────┐
                  ▼           ▼           ▼
             ┌─────────┐ ┌─────────┐ ┌─────────┐
@@ -41,8 +41,9 @@ your own agent, skip to **Adding your agent**.
   specialist that `main` starts as a requester-aware native subagent via
   `sessions_spawn`. OpenClaw records the source channel when the child starts,
   so its completion event returns to the same Discord/Slack conversation.
-  `main` acknowledges through the generic `message` tool, yields its turn, and
-  relays the real child result when that event arrives. There is no output
+  `main` ends its dispatch turn with a one-sentence acknowledgement and does
+  *not* wait: when the child's completion event arrives on a later turn, `main`
+  relays the real result through the generic `message` tool. There is no output
   directory or transcript polling in the live request path.
 - **Each request gets an isolated specialist session.** The specialist still
   uses its configured agent workspace, persona, skills, model, and persistent
@@ -219,11 +220,12 @@ channels.** The coordinator's `claude-cli` process cannot safely block on a
 multi-minute nested `sessions_send` call (two distinct kill mechanisms were
 confirmed live; full investigation:
 [SPECIALIST-TIMEOUT-INVESTIGATION.md](./SPECIALIST-TIMEOUT-INVESTIGATION.md)).
-The generated coordinator now uses `sessions_spawn` followed by
-`sessions_yield`. The child run carries the requester origin, and its
-completion event wakes `main`, whose normal reply is delivered back to that
-origin. This was verified against Discord with two separate bot messages:
-the initial working acknowledgement and the later completed result.
+The generated coordinator now dispatches with `sessions_spawn` and ends the
+turn with a brief acknowledgement — it never blocks waiting for the result.
+The child run carries the requester origin, and its completion event wakes
+`main` on a later turn, which relays the result back to that origin via the
+`message` tool. This was verified against Discord with two separate bot
+messages: the initial working acknowledgement and the later completed result.
 
 This changes the specialist session model: each request is a fresh native
 subagent session rather than the shared `agent:<id>:main` transcript.
