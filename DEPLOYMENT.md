@@ -528,15 +528,15 @@ cd ../openclaw-sales  && ./setup.sh
   `docker compose config | grep -E 'name:|container_name'` in each directory
   should show distinct volume/container names.
 
-## Subagents: stateless parallel fan-out (optional)
+## Subagents: requester-aware background work
 
-Subagents are a *different* mechanism from the coordinator pattern below: a
-running agent spawns **ephemeral background runs** with `sessions_spawn` to
-parallelize discrete tasks. Use them for stateless fan-out (e.g. "review these
-five files at once"), **not** for a persistent front desk — for "one Slack
-contact routing to persistent specialists" use the relay pattern in "Single
-point of contact → persistent specialists" below (it keeps specialist memory
-and needs no elevated tool profile).
+Native subagents are the coordinator's active delegation mechanism. A running
+agent starts an isolated child with `sessions_spawn`; OpenClaw records the
+requester's session and delivery origin, so completion can resume the parent
+and be pushed back to the same Discord/Slack/etc. conversation. The generated
+coordinator ends its dispatch turn with a brief acknowledgement and does not
+wait — the completion event arrives on its own from the spawn. There is no
+`sessions_yield` call and no runtime polling loop.
 
 Enable it on the agent that will spawn. Note `sessions_spawn` requires the
 `coding` or `full` tool profile — a `messaging`-profile agent has no spawn tool:
@@ -558,33 +558,38 @@ Keep in mind:
 - **Optional sandboxing.** For sandboxed children (`sandbox: require`), uncomment
   the `/var/run/docker.sock` mount and `group_add`/`DOCKER_GID` block in
   `docker-compose.yml`. Not needed for the default (logical session isolation).
-- **Slack caveat.** Announce-back to the requester conversation works, but
-  persistent thread-binding of follow-ups to a specific subagent is
-  Discord/iMessage/Matrix/Telegram only — on Slack the parent re-dispatches each
-  turn. See `docs.openclaw.ai/tools/subagents`.
+- **Session semantics.** Each run has a fresh child transcript, but uses the
+  target agent's configured workspace, persona, skills, model, and persistent
+  workspace memory files.
+- **Thread caveat.** This deployment uses one-shot `mode:"run"` jobs. Persistent
+  thread-bound subagent sessions have separate channel support requirements and
+  are not part of the coordinator flow here.
 
-## Single point of contact → persistent specialists (coordinator pattern)
+## Single point of contact → requester-bound specialist jobs
 
-Goal: one Slack channel (or TUI session) where the user talks to a single "front
-desk" agent that routes each request to the right specialist — transparently,
-with specialists keeping their own memory across turns. This is a **single
-deployment** of this template: every agent runs in one gateway, shares one
-Claude CLI login, and adds no infrastructure.
+Goal: one Discord/Slack channel where the user talks to a single "front desk"
+agent that routes each request to the right specialist and posts the completed
+result automatically. This is a **single deployment** of this template: every
+agent runs in one gateway, shares one Claude CLI login, and adds no
+infrastructure.
 
-**The mechanism (what actually works on Slack):** the coordinator relays via
-**cross-agent messaging**, not subagent spawning. It calls `sessions_send` to
-hand the request to a specialist's own session (waiting for the reply), then
-relays that reply to the user in its normal channel message. Because the
-coordinator owns the outbound reply, this is channel-agnostic — no Slack
-thread-binding caveats.
+**The mechanism:** `main` starts the selected configured agent through
+`sessions_spawn` and ends the turn with a one-sentence acknowledgement — it
+never blocks or yields. The spawn registers the requester origin, so the child
+completion event wakes `main` on a later turn; `main` then relays the completed
+result to that origin with the channel-agnostic `message` tool and ends with
+`NO_REPLY`.
 
-> **Critical:** `sessions_send` is **not** part of the `messaging` (or any) tool
-> profile — a profile alone will **not** expose it, and the coordinator will
-> silently fall back to non-OpenClaw tooling and fail to route. You must grant it
-> explicitly on the coordinator with `tools.allow: ["sessions_list",
-> "sessions_history", "sessions_send"]`. This is the single most common reason a
-> coordinator "sees" its specialists (via the read tools) but never dispatches to
-> them.
+> **Critical:** `main` needs capabilities from two profiles: `sessions_spawn`
+> is a coding tool while `message` is a messaging tool. The sync uses
+> `profile:"full"` and then narrows it with an explicit allowlist —
+> `sessions_list`, `sessions_history`, `sessions_spawn`, `message`, plus
+> `sessions_send` **only** when at least one enabled specialist uses
+> `dispatch:"send"` (the default manifest's `echo-bot` does, so its allowlist
+> has five tools; a spawn-only deployment has four). It also generates
+> `subagents.allowAgents` from the enabled manifest ids. `sessions_yield` is
+> deliberately excluded — on sonnet-5 the model treated it as "wait silently"
+> and suppressed the acknowledgement with `NO_REPLY`.
 
 ### Quickest path: `./setup.sh --sync-agents`
 
@@ -622,16 +627,11 @@ no-op patch) but **not silent**: it always restarts the gateway to apply the
 new tool policy, which **interrupts any live sessions** — run it during a
 quiet window on a box serving real Slack traffic.
 
-Confirm dispatch afterward (no Slack needed). Use a **fresh `--session`** —
-existing sessions load their persona at creation, so one created before the
-sync (e.g. the base setup verify's `main` session) won't have the coordinator
-instructions and will just answer directly:
-
-```bash
-docker compose run --rm -it openclaw-cli chat --session desk1
-#   › Please have the echo specialist repeat back: banana
-#   › expect the reply to contain  ECHO-BOT>> ... banana   (main relayed it)
-```
+Confirm the full lifecycle on a real messaging channel with a **fresh
+conversation** (`/new` on Discord, then send an echo request). Existing
+sessions retain the tool policy/persona they were created with. The sync also
+runs a headless event-level smoke check, but a detached CLI process is not a
+substitute for provider delivery.
 
 ### What gets configured (and why)
 
@@ -644,15 +644,29 @@ for the default manifest (one specialist, `echo-bot`):
   agents: {
     list: [
       { id: "main", default: true,           // front door: unrouted messages land here
-        tools: { allow: ["sessions_list", "sessions_history", "sessions_send"] }, // grant the relay tool explicitly
+        tools: {
+          profile: "full",
+          // sessions_send is added ONLY when a dispatch:"send" specialist
+          // exists (echo-bot is one in the default manifest); a spawn-only
+          // deployment drops it. sessions_yield is never granted.
+          allow: ["sessions_list", "sessions_history", "sessions_spawn",
+                  "sessions_send", "message"]
+        },
+        subagents: {
+          delegationMode: "prefer",
+          allowAgents: ["echo-bot"]
+        },
         workspace: "/home/node/.openclaw/workspace" },
-      { id: "echo-bot",                        // a persistent specialist (own session/memory)
+      { id: "echo-bot",                        // configured specialist agent
         workspace: "/home/node/.openclaw/agents/echo-bot/workspace",
         agentDir: "/home/node/.openclaw/agents/echo-bot/agent",  // runtime state, outside the workspace
         name: "🔁 Echo Bot", identity: { emoji: "🔁" },
         tools: { profile: "messaging" } }      // specialists that touch files/exec use "coding"
     ],
-    defaults: { skipBootstrap: true }          // pre-seeded agents ship their own persona
+    defaults: {
+      skipBootstrap: true,                     // pre-seeded agents ship their own persona
+      subagents: { runTimeoutSeconds: 180 }    // largest specialist timeoutMs
+    }
   },
   tools: {
     sessions:     { visibility: "all" },       // let main see/target other agents' sessions
@@ -664,19 +678,25 @@ for the default manifest (one specialist, `echo-bot`):
 
 The sync-owned enabling keys, verified against `openclaw config schema`:
 
-- **`agents.list[main].tools.allow` includes `sessions_send`** — the coordinator
-  can only relay if the tool is explicitly granted. `sessions_send` is in **no**
-  profile, so `tools.profile` alone leaves the coordinator unable to dispatch.
-  This is the key most easily missed.
-- **`tools.sessions.visibility: "all"`** — scope for `sessions_list/history/send`
+- **`agents.list[main].tools` spans spawn + message and is then narrowed** —
+  `profile:"full"` passes the profile filter for both coding (`sessions_spawn`)
+  and messaging (`message`) capabilities; the allowlist leaves only the
+  coordinator tools. `sessions_send` is appended only when a `dispatch:"send"`
+  specialist is enabled. `sessions_yield` is deliberately excluded — on sonnet-5
+  it lured the model into ending the dispatch turn with `NO_REPLY`, suppressing
+  the acknowledgement.
+- **`agents.list[main].subagents.allowAgents`** — explicit enabled specialist
+  ids, never `"*"`.
+- **`agents.defaults.subagents.runTimeoutSeconds`** — largest enabled
+  specialist `timeoutMs`, rounded up because native spawn has no per-call
+  timeout.
+- **`tools.sessions.visibility: "all"`** — scope for user-requested
+  `sessions_list/history`
   (`self` < `tree` (default) < `agent` < `all`). `all` lets the coordinator
-  target other agents' sessions.
-- **`tools.agentToAgent.enabled: true` + `allow: [...]`** — permits an agent to
-  invoke another at runtime. `allow` must include **both the coordinator and
-  every enabled specialist id** — despite the schema calling it a "target"
-  allowlist, a coordinator missing from its own `allow` gets `forbidden`
-  calling `sessions_send` (verified live; not just the docs — see
-  `AGENTS-PLUGINS.md` §2). Explicit ids, not `"*"` — least privilege by default.
+  inspect the child session key returned by a prior spawn when the user asks.
+- **`tools.agentToAgent` / `session.agentToAgent`** remain explicit for
+  backward-compatible manual inter-session use, but are not the active
+  requester-delivery path.
 - **`session.agentToAgent.maxPingPongTurns`** — after the specialist replies, how
   many reply-back turns the two agents may alternate (0–20). `0` (the manifest's
   default) = one exchange, no follow-up loop; set `coordinator.maxPingPongTurns`
@@ -700,41 +720,48 @@ it to the manifest, or confirm its removal with `./setup.sh --sync-agents
 deprecated alias for `--sync-agents` against the default manifest. Since the
 default manifest's only entry is the same `echo-bot` demo (now sourced from
 `examples/agents/echo-bot` instead of hardcoded), migration is automatic and
-in-place — but two defaults tighten: `tools.agentToAgent.allow` goes from
-`["*"]` to the explicit enabled-agent id list, and
-`session.agentToAgent.maxPingPongTurns` goes from `2` to `0`. The
-coordinator's hand-editable `AGENTS.md` also becomes fully sync-owned
-(overwritten on every sync going forward).
+in-place. The active coordinator path changes from a shared
+`agent:<id>:main` `sessions_send` exchange to an isolated requester-aware
+subagent job. `tools.agentToAgent.allow` also tightens from `["*"]` to explicit
+ids, and `session.agentToAgent.maxPingPongTurns` changes from `2` to `0`. The
+coordinator's hand-editable `AGENTS.md` becomes fully sync-owned (overwritten
+on every sync going forward).
 
 ### How the round-trip works
 
-1. The user messages the coordinator (the `default` agent) on Slack or in the TUI.
-2. The coordinator picks a specialist and calls `sessions_send(key="agent:<id>:main",
-   message=request, timeoutMs=<wait>)`. A standing agent's session key has the form
-   `agent:<id>:main` (e.g. `agent:echo-bot:main`).
-3. The specialist runs in **its own persistent session** (keeps memory across
-   calls) and returns its answer inline to the coordinator.
-4. The coordinator relays that answer to the user in its own channel reply — the
-   user sees one bot.
+1. The user messages `main` on Discord/Slack/etc.
+2. `main` picks a specialist and calls `sessions_spawn(agentId="<id>",
+   mode="run", task=request)`.
+3. The gateway registers the child with the requester session plus its
+   channel/account/target. `main` ends the turn with a one-sentence
+   acknowledgement — it does not yield or otherwise wait.
+4. The specialist runs in an isolated child session using its own configured
+   workspace/persona/skills/model.
+5. The child completion event resumes `main` on a later turn; `main` relays the
+   actual child result to the registered requester via the `message` tool and
+   ends with `NO_REPLY`.
 
-### Validating the coordinator (dashboard vs. local TUI)
+### Validating the coordinator
 
-**Do not test the coordinator from the local `chat` TUI.** The interactive TUI
-registers as a restricted Gateway client and **withholds `sessions_send`** — you
-will see only `sessions_list`/`sessions_history`, and `main` reports that
-`sessions_send` "isn't available". Cross-session tools are exposed on the
-surfaces that matter — **headless `agent` runs, the dashboard, and Slack** — not
-the local TUI. (This is easy to mistake for a broken config; it isn't.)
+Use a real messaging channel for the complete push lifecycle. A local TUI or a
+detached headless client can dispatch work, but it is not an external
+conversation that can receive a later provider message after the client exits.
 
 Two ways to validate:
 
-- **Headless one-shot** — the same kind of check `setup.sh --sync-agents` runs:
+- **Discord/Slack** — start a fresh conversation and ask for an echo. Expect
+  two bot messages: a working acknowledgement, then the completed echo result.
+
+- **Headless event smoke** — `setup.sh --sync-agents` creates a fresh session,
+  dispatches echo, and verifies in main's transcript that a
+  `source: subagent` completion event was followed by the expected assistant
+  token. This proves event routing, but not provider delivery. To dispatch by
+  hand:
   ```bash
   docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
     --agent main --message "Please have the echo specialist repeat back: banana" \
     --json --timeout 120
   ```
-  Expect `ECHO-BOT>>` (and `banana`) in the output.
 
 - **Dashboard (Control UI)** — to drive it by hand. The template binds the
   gateway to loopback with no published port, so the dashboard is unreachable by
@@ -936,11 +963,11 @@ See `docs.openclaw.ai/tools/subagents`.
   `agents.defaults`, which is a closed object. `agents.list` is a sibling of
   `agents.defaults`, and `bindings` is a top-level key. The gateway kept the
   previous valid config (nothing broke). Move the keys to the right level (see
-  "Single point of contact → persistent specialists"), or apply via `config
+  "Single point of contact → requester-bound specialist jobs"), or apply via `config
   patch`, then `config validate` before restarting. Inspect the real schema any
   time with `docker compose run --rm openclaw-cli config schema`.
 - **Coordinator says `sessions_spawn` isn't available (only `sessions_list` /
-  `sessions_history` / `sessions_yield`)** — its tool profile doesn't include
+  `sessions_history`)** — its tool profile doesn't include
   the spawn tool. `sessions_spawn` is in the `coding`/`full` profiles only; a
   messaging/default-profile agent never gets it. Set
   `agents.list[main].tools.profile: "full"` and restart. Verify inside the TUI
@@ -959,10 +986,11 @@ See `docs.openclaw.ai/tools/subagents`.
   (e.g. the `main` session from setup's verify step, recognizable by leftover
   `SETUP_SCRIPT_OK` history). Sessions load their agent persona at creation.
   Start a fresh one: `docker compose run --rm -it openclaw-cli chat --session
-  desk1`. If a brand-new session still won't relay, force the tool to isolate
-  the cause: `Use the sessions_send tool to send "banana" to agent "echo-bot",
-  wait for the reply, and return it` — a working result means it's persona
-  wording, not plumbing.
+  desk1`. If a brand-new provider conversation still won't delegate, force the
+  tool to isolate the cause:
+  `Use sessions_spawn with agentId "echo-bot" to run: echo banana` — a child
+  completion event means the plumbing works and the remaining issue is
+  persona/provider delivery.
 - **This repo has no application source, on purpose** — don't `git clone` the
   full `openclaw/openclaw` project expecting to find more here; everything
   needed to run is in this repo (the compose files plus your `.env`) alongside

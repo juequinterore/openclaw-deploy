@@ -12,7 +12,7 @@ This repo currently wires in three specialists as a worked example:
 |---|---|
 | `echo-bot` | Reference/demo specialist — echoes back whatever it's sent. No real capability, no external deps. Used as the offline smoke test. |
 | `sallie` | Event lead intake: scores leads, pushes contacts/notes to HubSpot. |
-| `virginia` | Company research: builds an executive one-pager (PDF) via web research + Playwright rendering. |
+| `virginia` | Company research: builds an executive one-pager (PDF + editable HTML) and a ready-to-send cold email (`cold-email.md`). |
 
 If you're just here to run it, skip to **Quick start**. If you're plugging in
 your own agent, skip to **Adding your agent**.
@@ -21,26 +21,33 @@ your own agent, skip to **Adding your agent**.
 
 ```
                     ┌─────────────┐
-   Slack / webchat  │             │
+ Discord / Slack   │             │
    ────────────────▶│    main     │  coordinator — the only agent users talk to
    (one channel,     │ (coordinator)│
     one bot)         └──────┬──────┘
-                             │ sessions_send(key="agent:<id>:main", timeoutMs=...)
+                             │ sessions_spawn(agentId="<id>") → completion event
                  ┌───────────┼───────────┐
                  ▼           ▼           ▼
             ┌─────────┐ ┌─────────┐ ┌─────────┐
-            │echo-bot │ │ sallie  │ │virginia │   specialists — each a
-            │(coding) │ │(coding) │ │(coding) │   persistent, independent
-            └─────────┘ └─────────┘ └─────────┘   session with its own memory
+            │echo-bot │ │ sallie  │ │virginia │   specialists — isolated runs
+            │(coding) │ │(coding) │ │(coding) │   using each agent's own
+            └─────────┘ └─────────┘ └─────────┘   workspace, persona, and memory
 ```
 
 - **One deployment = one gateway container**, running the OpenClaw Gateway
   image via Docker Compose, talking to the model through **Claude CLI OAuth**
   (no model API keys to manage).
 - **`main` is the only agent users interact with.** Everything else is a
-  standing, persistent specialist session that `main` delegates to via the
-  `sessions_send` tool, then relays the reply back in its own channel
-  response — so from the user's side it always looks like one bot.
+  specialist that `main` starts as a requester-aware native subagent via
+  `sessions_spawn`. OpenClaw records the source channel when the child starts,
+  so its completion event returns to the same Discord/Slack conversation.
+  `main` ends its dispatch turn with a one-sentence acknowledgement and does
+  *not* wait: when the child's completion event arrives on a later turn, `main`
+  relays the real result through the generic `message` tool. There is no output
+  directory or transcript polling in the live request path.
+- **Each request gets an isolated specialist session.** The specialist still
+  uses its configured agent workspace, persona, skills, model, and persistent
+  workspace files; only conversational transcript state is fresh per job.
 - **Routing is prompt-driven and identity-agnostic.** `main`'s persona
   (`AGENTS.md`, auto-generated) contains a routing table — one row per
   specialist, built from that specialist's declared `role` — and `main`
@@ -74,12 +81,12 @@ fails partway, is in **[DEPLOYMENT.md](./DEPLOYMENT.md)**.
 Talk to it once it's up:
 
 ```bash
-# Headless one-shot (also how automated checks talk to it)
+# Headless dispatch smoke check (real channels provide the complete push UX)
 docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
   --agent main --message "Please have the echo specialist repeat back: banana" \
   --json --timeout 60
 
-# Interactive local terminal chat (routing/delegation doesn't work here — see Known limitations)
+# Interactive local terminal chat (requester-bound push does not work here)
 docker compose run --rm -it openclaw-cli chat
 ```
 
@@ -208,40 +215,29 @@ dependencies, also read **AGENTS-DEPS-SPEC.md**.
 
 ## Known limitations
 
-**Long-running specialists (multi-minute tasks) can report a false timeout
-to the user even though the work completes successfully.** Full
-investigation, root cause, and verified workaround:
-[SPECIALIST-TIMEOUT-INVESTIGATION.md](./SPECIALIST-TIMEOUT-INVESTIGATION.md).
-Summary: this is a real, confirmed bug in how the `claude-cli` runtime handles a nested `sessions_send`
-call: `main`'s own CLI process can conclude its turn (clean exit) while the
-specialist's reply is still pending — anywhere from ~1 to ~2.5 minutes in,
-independent of any configured `timeoutMs` — and the gateway then reports a
-hard error (`"CLI message tool call remained in flight after exit"`) even
-though the specialist keeps working and finishes normally moments later.
-Confirmed by direct process inspection: the specialist's underlying process
-stays alive and produces real output well after `main` has already given up.
-This is not documented upstream and not fixable via `sessions_send`'s own
-`timeoutMs` or any MCP-related env var (tested and ruled out).
+**Long specialist tasks are asynchronous and push-based on real messaging
+channels.** The coordinator's `claude-cli` process cannot safely block on a
+multi-minute nested `sessions_send` call (two distinct kill mechanisms were
+confirmed live; full investigation:
+[SPECIALIST-TIMEOUT-INVESTIGATION.md](./SPECIALIST-TIMEOUT-INVESTIGATION.md)).
+The generated coordinator now dispatches with `sessions_spawn` and ends the
+turn with a brief acknowledgement — it never blocks waiting for the result.
+The child run carries the requester origin, and its completion event wakes
+`main` on a later turn, which relays the result back to that origin via the
+`message` tool. This was verified against Discord with two separate bot
+messages: the initial working acknowledgement and the later completed result.
 
-**Workaround** (not yet wired into the coordinator persona by default): have
-`main` dispatch with a short acknowledgement wait (~15–20s) instead of the
-specialist's full budget, tell the user it's been kicked off, and retrieve
-the result on a *later* turn via `session_status` / `sessions_history` —
-never `sessions_send` again once the specialist has actually started. This
-turns a long task into a two-turn interaction (dispatch, then "check back")
-rather than one blocking exchange. There's currently no push-notification
-path to avoid the second turn: the `message` tool cannot deliver to the
-webchat/dashboard surface (`"Unknown channel: webchat"` — it only targets
-real external providers like Slack/Discord/Telegram with an explicit
-target), so until Slack is wired up for a given deployment, the user has to
-be the one to ask again.
+This changes the specialist session model: each request is a fresh native
+subagent session rather than the shared `agent:<id>:main` transcript.
+Workspace state and memory files still persist, but conversational transcript
+state does not automatically carry from one specialist job to the next.
 
-**The local interactive TUI (`chat --session`) cannot exercise delegation.**
-It's a restricted Gateway client that withholds `sessions_send` even when
-it's in `main`'s `tools.allow` — you'll see `main` report the tool "isn't
-available." Cross-session tools work on headless one-shot runs, the
-dashboard, and real channels (Slack, etc.) — just not this one. Don't use it
-to debug a "broken" coordinator; it'll always look broken there.
+**The local interactive TUI and a detached headless one-shot are not good
+push-delivery surfaces.** They can start delegation, but there is no external
+conversation for a later completion message to reach after the client exits.
+Use Discord/Slack/etc. for the complete asynchronous UX. A user can still ask
+for status explicitly; `main` reads the child session returned by the original
+spawn and never starts a duplicate run.
 
 **A session's tool policy is frozen at creation.** After any config change
 (including `--sync-agents`), always test against a brand-new `--session` /

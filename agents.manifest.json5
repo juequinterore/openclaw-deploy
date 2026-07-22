@@ -16,11 +16,15 @@
   //   id: "main",
   //   name: "🧭 Front Desk",
   //   maxPingPongTurns: 0,
-  //   defaultTimeoutMs: 180000,
+  //   defaultTimeoutMs: 180000,  // per-specialist "typically done within" shown to users (overridable per agent via timeoutMs)
   // },
 
   agents: [
-    { source: "examples/agents/echo-bot", ref: null },
+    // dispatch "send": echo answers in seconds and benefits from its
+    // persistent session — the worked example of the synchronous
+    // request/reply mode (long-job specialists like virginia use the default
+    // "spawn" background mode instead).
+    { source: "examples/agents/echo-bot", ref: null, dispatch: "send" },
 
     // Worked example — a real, pre-existing agent repo with no
     // openclaw.agent.json5 (Model B: declare its shape inline). Sallie is a
@@ -31,9 +35,14 @@
     //
     { source: "git@bitbucket.org:57blocks/sallie.git", ref: "chore/testing-standards-and-tests",
       id: "sallie", name: "Sallie", role: "Event lead intake, scoring, HubSpot pushes.",
-      model: "anthropic/claude-sonnet-4-6",   // this deploy runs claude-cli, not her native gpt-5.4
+      model: "anthropic/claude-sonnet-5",   // this deploy runs claude-cli, not her native gpt-5.4
       tools: { profile: "coding" },
-      timeoutMs: 600000,                       // real HubSpot intake (extract + resolver CLI + create/note/associate) runs ~2-3 min; 180s default is too tight
+      // Owner-confirmed fast responder (well under the 30s send window), so
+      // she uses the synchronous request/reply mode and keeps conversational
+      // continuity in her persistent session. If real intake runs start
+      // missing the window, flip back to the default "spawn".
+      dispatch: "send",
+      timeoutMs: 600000,                       // "typically done within" budget quoted to users (send replies are near-instant; this bounds worst-case)
 
       env: {
         // Only secret the branch's skill code actually reads at runtime
@@ -54,8 +63,21 @@
     // sync will abort with the exact Dockerfile lines to append (chromium is a
     // root/apt image layer, never installed into a workspace).
     { source: "git@bitbucket.org:57blocks/onepagerbuilder.git",
-      ref: "chore/openclaw-deploy-compat" ,
-      timeoutMs: 600000,
+      ref: "feature/email_sub_agent",
+      timeoutMs: 1500000,  // 25-minute safety ceiling; typical full research + rendering runs take 6-15 minutes
+      // The gateway's default thinking=adaptive let sonnet burn two ~30K-token
+      // extended-thinking blocks (~17 min of wall-clock) authoring one brief
+      // (measured live, StudyFetch 2026-07-17). Her workflow is script-driven;
+      // "low" keeps a small reasoning budget for brief quality without the
+      // multi-minute burn. Passed through as sessions_spawn's per-spawn
+      // `thinking` override. This is the DEFAULT — a user can override per
+      // request in chat ("… use medium thinking"), which the coordinator
+      // applies to the spawn instead.
+      thinking: "low",
+      // Appended verbatim to every task dispatched to virginia. It both forces
+      // the complete workflow and stages all user-facing files under main's
+      // media-allowed workspace so Discord/Slack can attach them.
+      taskHint: "Work ONLY on the company named in this task: never resume, complete, or deliver another company's artifacts, even if outputs/ contains in-progress work from other jobs (concurrent or interrupted runs leave such state; it is not yours). Run your complete one-pager workflow. The required user-facing deliverables are the rendered PDF, the editable .editor.html, and outputs/<slug>/cold-email.md; a text-only summary is not finished. Before your final reply, copy those three files into /home/node/.openclaw/workspace/deliveries/<slug>/<render-stamp>/ using the actual slug and render stamp. Include the three copied absolute paths as separate plain MEDIA: lines and name all three files in your reply. Do not attach the plain intermediate .html.",
       },
   ],
 }

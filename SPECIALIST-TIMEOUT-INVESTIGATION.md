@@ -1,10 +1,27 @@
 # Long-Running Specialist "False Timeout" — Investigation & Findings
 
-**Status: root cause confirmed, workaround verified end-to-end, not yet wired
-into the coordinator persona.** This document records what was tested, what
-was ruled out, and what was proven to work — so the fix can be implemented
-later without re-running this investigation, and so anyone hitting the same
-symptom doesn't waste time on the dead ends already ruled out here.
+**Status: FIXED (2026-07-17).** The final implementation uses requester-aware
+native subagents: `sessions_spawn` starts the specialist and the coordinator
+ends that turn with a one-sentence acknowledgement — it does **not** call any
+waiting or yielding tool. The spawn itself registers the requester's
+Discord/Slack/etc. origin, so the child's completion event is delivered back to
+`main` on its own, on a later turn. On that completion turn `main` relays the
+real child result to the source conversation via the `message` tool and ends
+with `NO_REPLY`. (`sessions_yield` was tried and rejected: on sonnet-5 the model
+treated it as "wait silently" and ended the dispatch turn with `NO_REPLY`,
+suppressing the user-facing acknowledgement — so the coordinator is granted
+`sessions_spawn` + `message` but **not** `sessions_yield`.) The sync-owned
+config patch also raises the `claude-cli` resumed-session no-output watchdog
+from 60s to 180s as defense-in-depth.
+
+An intermediate dispatch-then-poll implementation is documented below because
+it fixed the coordinator crash, but its claimed proactive-delivery extension
+was wrong. Live Discord testing proved that `sessions_send`'s later
+`mode:"announce"` delivery resolves the **target specialist session**
+(`agent:virginia:main`, internal `webchat`), not the Discord session that
+requested the work. `main` is never woken, so granting it `message` cannot
+deliver anything. That is why the final fix replaces the dispatch primitive
+rather than adding another poller.
 
 Referenced briefly in [README.md](./README.md)'s "Known limitations" — this
 is the full writeup.

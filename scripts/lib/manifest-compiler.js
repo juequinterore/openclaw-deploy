@@ -33,8 +33,22 @@ const PACKAGE_FIELDS = new Set([
 // in on this box.
 const MANIFEST_ONLY_FIELDS = new Set([
   "source", "ref", "enabled", "disableSkills", "denyTools", "timeoutMs",
-  "routeHint", "allowInstallScripts", "allowSystemDeps",
+  "routeHint", "taskHint", "thinking", "dispatch", "allowInstallScripts", "allowSystemDeps",
 ]);
+// How the coordinator reaches this specialist. "spawn" (default): one-shot
+// background job via sessions_spawn with requester-bound completion delivery
+// — right for anything longer than the coordinator's safe synchronous window
+// (~45s). "send": synchronous request/reply via sessions_send to the
+// specialist's persistent main session — right for quick stateful responders
+// (sub-30s replies) where conversational continuity matters; there is NO
+// background delivery on this path, so never use it for long jobs.
+const DISPATCH_MODES = new Set(["spawn", "send"]);
+// Passed through as sessions_spawn's per-spawn `thinking` override. "off" cut
+// a measured 17 minutes of wall-clock from virginia's brief-authoring stage
+// (two ~30K-token extended-thinking blocks under the gateway's default
+// thinking=adaptive). Loose allowlist: warn (not error) on unknown values so
+// a newer image's levels aren't rejected by this repo.
+const KNOWN_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "adaptive"]);
 const MANIFEST_AGENT_FIELDS = new Set([...PACKAGE_FIELDS, ...MANIFEST_ONLY_FIELDS]);
 const MANIFEST_TOP_FIELDS = new Set(["coordinator", "agents"]);
 const COORDINATOR_FIELDS = new Set(["id", "name", "maxPingPongTurns", "defaultTimeoutMs"]);
@@ -202,7 +216,6 @@ function parseManifest(manifestText) {
   if (coordinator.id !== undefined && (typeof coordinator.id !== "string" || !ID_RE.test(coordinator.id))) {
     errors.push(`coordinator.id '${coordinator.id}' must match ${ID_RE}`);
   }
-
   if (!Array.isArray(raw.agents)) {
     errors.push("agents.manifest.json5: 'agents' must be an array");
     return errors.length ? fail(errors, warnings) : ok({ coordinator, agents: [] }, warnings);
@@ -304,6 +317,9 @@ function parseManifest(manifestText) {
         denyTools: entry.denyTools || [],
         timeoutMs: entry.timeoutMs,
         routeHint: entry.routeHint,
+        taskHint: entry.taskHint,
+        thinking: entry.thinking,
+        dispatch: entry.dispatch,
       },
     });
   });
@@ -463,6 +479,21 @@ function lintPostfetch(input) {
     if (!ov.routeHint && !effective.role) {
       warnings.push(`${label}: no role (package) or routeHint (manifest) given — coordinator routing table will show a placeholder for '${effective.id}'`);
     }
+    if (ov.taskHint !== undefined && (typeof ov.taskHint !== "string" || !ov.taskHint.trim())) {
+      errors.push(`${label}: 'taskHint' must be a non-empty string`);
+    }
+    const taskHint = typeof ov.taskHint === "string" ? ov.taskHint.trim() : undefined;
+    if (ov.thinking !== undefined && (typeof ov.thinking !== "string" || !ov.thinking.trim())) {
+      errors.push(`${label}: 'thinking' must be a non-empty string (e.g. "off", "low")`);
+    }
+    const thinking = typeof ov.thinking === "string" ? ov.thinking.trim() : undefined;
+    const dispatch = ov.dispatch === undefined ? "spawn" : ov.dispatch;
+    if (!DISPATCH_MODES.has(dispatch)) {
+      errors.push(`${label}: 'dispatch' must be one of ${[...DISPATCH_MODES].join("/")} (got '${ov.dispatch}')`);
+    }
+    if (thinking !== undefined && !KNOWN_THINKING_LEVELS.has(thinking)) {
+      warnings.push(`${label}: thinking '${thinking}' is not one of the known levels (${[...KNOWN_THINKING_LEVELS].join(", ")}) — passing through anyway in case the runtime supports it`);
+    }
 
     effectiveAgents.push({
       slug: a.slug,
@@ -473,6 +504,9 @@ function lintPostfetch(input) {
       skills: effectiveSkills,
       tools: Object.keys(tools).length ? tools : undefined,
       routeHint,
+      taskHint,
+      thinking,
+      dispatch,
       timeoutMs,
       disableSkills,
       denyTools,
@@ -492,11 +526,49 @@ function lintPostfetch(input) {
 function assemble(input) {
   const { coordinator, effectiveAgents, currentAgentsList } = input;
   const warnings = [];
+  // sessions_spawn has one configured run timeout for all native subagents,
+  // not a per-call timeout. Use the largest specialist completion budget so a
+  // slow specialist is not killed merely because a faster one is also wired
+  // into the same deployment. Per-row timeoutMs remains a user-facing estimate
+  // in the generated routing table.
+  const subagentRunTimeoutSeconds = Math.max(
+    1,
+    ...effectiveAgents.map((a) => Math.ceil(a.timeoutMs / 1000))
+  );
 
   const coordinatorEntry = {
     id: coordinator.id,
     default: true,
-    tools: { allow: ["sessions_list", "sessions_history", "sessions_send"] },
+    // A native subagent run records the requester's channel/account/target and
+    // emits a completion event back to that requester (the spawn registration
+    // does this — no extra subscription step needed). `message` delivers
+    // results/acks to the current source conversation without hardcoding
+    // Discord/Slack/etc.
+    //
+    // sessions_yield is deliberately ABSENT: completions arrive without it
+    // (verified repeatedly), and when the model could call it, it treated
+    // yield as "wait silently" and ended dispatch turns with NO_REPLY —
+    // suppressing the user-facing acknowledgement (observed live on
+    // sonnet-5, 2026-07-17).
+    //
+    // sessions_send appears ONLY when a send-mode specialist exists: it is
+    // the synchronous request/reply primitive for quick stateful responders
+    // (dispatch: "send"), and granting it unconditionally invites the model
+    // to misuse it for long jobs (the original false-timeout failure).
+    tools: {
+      profile: "full",
+      allow: [
+        "sessions_list",
+        "sessions_history",
+        "sessions_spawn",
+        ...(effectiveAgents.some((a) => a.dispatch === "send") ? ["sessions_send"] : []),
+        "message",
+      ],
+    },
+    subagents: {
+      delegationMode: "prefer",
+      allowAgents: effectiveAgents.map((a) => a.id),
+    },
     workspace: "/home/node/.openclaw/workspace",
   };
 
@@ -520,7 +592,17 @@ function assemble(input) {
   const patch = {
     agents: {
       list: newAgentsList,
-      defaults: { skipBootstrap: true },
+      defaults: {
+        skipBootstrap: true,
+        subagents: {
+          runTimeoutSeconds: subagentRunTimeoutSeconds,
+        },
+        cliBackends: {
+          "claude-cli": {
+            reliability: { watchdog: { resume: { noOutputTimeoutMs: 180000 } } },
+          },
+        },
+      },
     },
     tools: {
       sessions: { visibility: "all" },
@@ -564,10 +646,21 @@ function assemble(input) {
   const coordinatorRoutingRows = effectiveAgents.map((a) => ({
     id: a.id,
     routeHint: a.routeHint,
+    taskHint: a.taskHint ?? null,
+    thinking: a.thinking ?? null,
+    dispatch: a.dispatch ?? "spawn",
     timeoutMs: a.timeoutMs,
   }));
 
-  return ok({ patch, foreignIds, summary, coordinatorRoutingRows, coordinatorName: coordinator.name, maxPingPongTurns: coordinator.maxPingPongTurns }, warnings);
+  return ok({
+    patch,
+    foreignIds,
+    summary,
+    coordinatorRoutingRows,
+    coordinatorName: coordinator.name,
+    maxPingPongTurns: coordinator.maxPingPongTurns,
+    subagentRunTimeoutSeconds,
+  }, warnings);
 }
 
 function run(input) {

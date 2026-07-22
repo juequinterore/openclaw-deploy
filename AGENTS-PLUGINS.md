@@ -14,7 +14,13 @@
 > 2026-07-15** with auto-extracted Python dependencies, Python as a
 > first-class base-image runtime, and a declared+self-describing OS-deps
 > channel — §7.3/§7.4 below; full design and live verification in
-> `AGENTS-DEPS-SPEC.md`.
+> `AGENTS-DEPS-SPEC.md`. **Routing corrected 2026-07-17**: the coordinator's
+> default path is requester-aware `sessions_spawn` (with a brief acknowledgement
+> and no `sessions_yield`), not a blocking `sessions_send`, because live Discord
+> testing proved the latter announces completion to the target specialist's
+> internal session rather than the original requester. `sessions_send` survives
+> only as an opt-in per-specialist `dispatch: "send"` mode for quick stateful
+> responders.
 
 ## 1. Goal
 
@@ -22,7 +28,7 @@ Today an agent (e.g. the `echo-bot` from `setup.sh --agents`) is scaffolded
 *inside* this repo. The real goal is the opposite: agents are **built and
 maintained in their own git repos, elsewhere**, and this deployment **pulls them
 in, pinned to a ref**, and wires them into the running gateway — behind the
-existing single-Slack-contact coordinator. `echo-bot` becomes just the reference
+existing single-channel coordinator. `echo-bot` becomes just the reference
 example of the package format, not a special case.
 
 Concretely, after this exists you should be able to write:
@@ -39,9 +45,9 @@ Concretely, after this exists you should be able to write:
 ```
 
 then run `./setup.sh --sync-agents`, and end up with a `billing` and an `sre`
-specialist standing behind `main`, reachable through the same `sessions_send`
-relay the template already uses — with nothing agent-specific committed to this
-repo except that manifest.
+specialist behind `main`, reachable through requester-aware native subagent
+runs — with nothing agent-specific committed to this repo except that
+manifest.
 
 ## 2. What an OpenClaw agent actually is (grounding)
 
@@ -99,6 +105,16 @@ Hard facts that shape the whole design (all *(verified)*):
   title at face value without exercising a genuinely fresh session and got
   this wrong. §5's assembly includes the coordinator id in `allow` alongside
   every enabled specialist id.
+- **`sessions_spawn` is the requester-aware completion primitive in this pinned
+  image.** It registers the requester session key plus delivery origin
+  (channel/account/target/thread), and native child completion is push-based.
+  `agents.list[].subagents.allowAgents` is the spawn target allowlist.
+  The coordinator ends its dispatch turn with a plain acknowledgement — it does
+  **not** call `sessions_yield` (on sonnet-5 that lured the model into ending
+  the turn with `NO_REPLY`, suppressing the acknowledgement); the completion
+  event resumes `main` on its own. This is the live routing path; the
+  `tools.agentToAgent` fact above remains relevant only to legacy/manual
+  `sessions_send` use (the opt-in `dispatch: "send"` mode).
 - **`agents.defaults.skipBootstrap` is a valid schema key** *(verified)* —
   needed because `agents.defaults` rejects unknown keys.
 
@@ -307,9 +323,16 @@ Because `$include` can't append a single agent (see §2), `--sync-agents`
 
 1. Start with the coordinator entry (`coordinator.id`, default `main`):
    `default: true`,
-   `tools.allow: [sessions_list, sessions_history, sessions_send]` — **no
-   profile**, because `sessions_send` is in no profile; this is the same relay
-   wiring the current `--agents` uses. The coordinator keeps the deployment's
+   `tools.profile: "full"` plus the narrow allowlist
+   `[sessions_list, sessions_history, sessions_spawn, message]` (with
+   `sessions_send` appended only when at least one enabled specialist declares
+   `dispatch: "send"`). `full` is required before narrowing because
+   `sessions_spawn`/`sessions_send` belong to the coding profile while
+   `message` belongs to messaging. `sessions_yield` is deliberately **not**
+   granted — on sonnet-5 it lured the model into ending the dispatch turn with
+   `NO_REPLY`, suppressing the acknowledgement. The entry also gets
+   `subagents: { delegationMode: "prefer", allowAgents: [<enabled ids>] }`.
+   The coordinator keeps the deployment's
    **default workspace** `/home/node/.openclaw/workspace` (host:
    `.openclaw-data/workspace`) and default `agentDir` — it is deployment-owned,
    not a manifest agent, so it does not live under `agents/<id>/`.
@@ -343,6 +366,9 @@ Because `$include` can't append a single agent (see §2), `--sync-agents`
    - `agents.defaults.skipBootstrap: true` *(verified valid key)* — pre-seeded
      agents ship their persona, so the interactive first-run bootstrap ritual
      must be skipped.
+   - `agents.defaults.subagents.runTimeoutSeconds` — the largest enabled
+     specialist `timeoutMs`, rounded up to seconds. Native spawn has one
+     configured run timeout rather than a per-call timeout.
 5. `config validate`, then `docker compose restart openclaw-gateway`. (A
    claude-cli session's tool policy is frozen at session creation, so a restart
    plus fresh sessions are required for new agents to pick up their policy.
@@ -368,6 +394,7 @@ sync, with values derived only from the manifest**:
 | `tools.agentToAgent` | whole object; `allow` rebuilt from enabled ids |
 | `session.agentToAgent.maxPingPongTurns` | from `coordinator` |
 | `agents.defaults.skipBootstrap` | `true` |
+| `agents.defaults.subagents.runTimeoutSeconds` | largest enabled specialist `timeoutMs`, rounded up |
 
 Because nothing is written conditionally and no key outside this set is ever
 touched (in particular, **never** the global `skills.entries.*` — see §7), a
@@ -402,9 +429,11 @@ For each git-sourced, enabled agent:
      package at the new ref are deleted from the target (so stale persona files
      from an older ref never linger), **except** the protected set, which the
      sync never deletes or overwrites: an existing `MEMORY.md` (seed-only, §9),
-     `memory/`, `sessions/`, `openclaw-workspace-state.json`, `.openclaw/`,
-     `*.sqlite*`. (`rsync --delete` with an exclude list, or an equivalent
-     tracked-file-list copy.)
+     an existing `outputs/` (seed-only, same rule — it holds the agent's
+     runtime work products, e.g. rendered deliverables a user hasn't
+     retrieved yet), `memory/`, `sessions/`, `openclaw-workspace-state.json`,
+     `.openclaw/`, `*.sqlite*`. (`rsync --delete` with an exclude list, or an
+     equivalent tracked-file-list copy.)
    - Skills disabled for this deploy (`disableSkills`, §7) have their
      `workspace/skills/*/` directories **skipped** during the copy — matched by
      SKILL.md frontmatter `name` (dir basename as fallback), per §7.
@@ -652,11 +681,15 @@ hand-edits overwritten. Deploy-specific routing lives in the manifest
 (`role` / `routeHint` / `timeoutMs`), not in hand-edits. The generated file
 starts with a marker saying exactly that.
 
-This template is the design artifact — the routing table rows come from the
-manifest (`routeHint` overrides the package's `role`; `timeoutMs` falls back to
-`coordinator.defaultTimeoutMs`), and the session discipline block ships
-verbatim (it encodes the standing-session lessons from the working reference
-config):
+The routing table rows come from the manifest (`routeHint` overrides the
+package's `role`; `timeoutMs` falls back to `coordinator.defaultTimeoutMs`; the
+`dispatch` column reflects each agent's `dispatch` mode), and the session
+discipline block ships verbatim. The excerpt below is **abridged for reading** —
+the real generated file (see `scripts/sync-agents.sh` §6) additionally spells
+out the spawn/send asymmetry rules, per-specialist `taskHint` dispatch
+requirements, one-job-per-spawn splitting, the `thinking` override, and the
+full completion/status protocol. Treat that script as the source of truth;
+this section shows the shape:
 
 ```markdown
 <!-- GENERATED by `setup.sh --sync-agents` from agents.manifest.json5.
@@ -669,32 +702,48 @@ work yourself, even when you know the answer.
 
 ## Specialists
 
-| id | routes to it when | session key | timeoutMs |
+| id | routes to it when | dispatch | typically done within |
 |---|---|---|---|
-| billing | Invoices, refunds, payment disputes. | agent:billing:main | 180000 |
-| sre | Incidents, on-call, log triage. | agent:sre:main | 900000 |
-<!-- one row per enabled manifest agent -->
+| echo-bot | Echo/repeat-back requests. | `send: sessionKey="agent:echo-bot:main"` | ~1 min |
+| billing | Invoices, refunds, payment disputes. | `spawn: agentId="billing"` | ~3 min |
+| sre | Incidents, on-call, log triage. | `spawn: agentId="sre"` | ~15 min |
+<!-- one row per enabled manifest agent; dispatch marked spawn: or send: -->
 
 ## How to relay
 
-1. Pick exactly ONE specialist from the table. If none clearly matches, do not
-   guess: tell the user what you can route to and ask them to pick.
-2. Call `sessions_send(key="agent:<id>:main", message="<the user's request,
-   verbatim, plus any context they gave earlier in this conversation>",
-   timeoutMs=<that row's timeoutMs>)`.
-3. Return the specialist's reply to the user, attributed ("billing says: …").
-   Do not rewrite it, summarize away actionable content, or answer from your
-   own knowledge instead.
-4. If `sessions_send` times out, tell the user which specialist timed out and
-   after how long. Retry at most once, and only if the user asks.
+1. Pick the matching specialist(s). If none matches, do not guess: tell the
+   user what you can route to and ask them to pick.
+2. Use the row's dispatch mode. For a `spawn:` row, call
+   `sessions_spawn(<the row's parameters>, runtime="subagent", mode="run",
+   cleanup="keep", task="<the user's request verbatim, conversation context,
+   and the specialist's manifest taskHint verbatim>")`, then end the turn with
+   one brief acknowledgement — never `sessions_yield`, never poll; the
+   completion event arrives on its own. For a `send:` row, call
+   `sessions_send(<the row's parameters>, message="…", timeoutSeconds=30)` and
+   relay the reply in the same turn. NEVER dispatch a `spawn:` specialist via
+   `sessions_send` (its result outlives the synchronous wait and is lost).
+
+## Completion events
+
+- When `A background task completed` arrives, relay the actual child result
+  through `message(action="send", ...)` to the requester conversation.
+- Convert every plain `MEDIA:<absolute path>` line in the child result into
+  one structured file attachment on that same message. Attach every
+  user-facing deliverable, including PDF, editable HTML, Markdown, and reports.
+- Specialist task hints may require copying deliverables into the
+  coordinator's `workspace/deliveries/` tree first. This is required when the
+  provider's local-media policy cannot read another agent's workspace.
+- After delivering, end the turn with `NO_REPLY`. Do not answer `NO_REPLY`
+  merely because the working acknowledgement was already sent — suppress only a
+  duplicate completion event for the same child.
+- Do not poll. If the user explicitly asks for status, inspect the original
+  child's session via `sessions_history`.
 
 ## Session discipline
 
-- Never send status-only replies ("working on it…", "let me check…"). Hold
-  your reply until you have the specialist's answer or a timeout to report.
-- Stale inter-session messages: if an inter-session message arrives that is a
-  late reply to an exchange you already closed out, reply with exactly
-  `REPLY_SKIP` and nothing else.
+- Never invent or preview a specialist result.
+- Never start the same request twice.
+- Stale completion already delivered: reply `NO_REPLY`.
 - Heartbeat polls: reply with exactly `HEARTBEAT_OK`. Never relay a heartbeat
   to a specialist.
 - Announce/system notices that need no action: reply `ANNOUNCE_SKIP`.
@@ -724,10 +773,10 @@ work yourself, even when you know the answer.
 - **Review the persona.** `AGENTS.md`/`SOUL.md` are prompts executed under your
   agent's authority; treat a new agent repo like a dependency you audit before
   pinning it.
-- **`allow: ["*"]` is wide.** The sync generates `tools.agentToAgent.allow` as
-  the coordinator id plus the explicit enabled-agent id set from the manifest
-  (both callers and callees must be listed — §2 correction), not `"*"` — still
-  least privilege by default, just not target-only.
+- **Spawn access is explicit.** The sync generates the coordinator's
+  `subagents.allowAgents` from the enabled manifest ids, never `"*"`.
+  The legacy `tools.agentToAgent.allow` is also kept explicit for manual
+  inter-session compatibility.
 - **Secrets flow from the deployment's `.env`**, never from agent repos. Agent
   `.gitignore` excludes `.env`; the sync refuses to copy a `.env` from a package
   if one is present (fail loud).
@@ -762,8 +811,10 @@ of the current scaffold). Pseudobehavior:
   6. regenerate main/AGENTS.md from the §8 template (sync-owned, overwritten)
   7. docker compose restart openclaw-gateway   (interrupts live sessions — §5 step 5)
   8. verify: for each agent, headless `agent --agent <id>` smoke check;
-     then a coordinator relay check (main routes a sample request and returns
-     the specialist reply)
+     then a coordinator spawn-completion check that proves a source=subagent
+     completion event reached main and main produced the child token
+     (plus, when a dispatch:"send" specialist exists, a synchronous send-relay
+     check through the first such specialist)
   9. on ANY failure in 5–8: restore openclaw.json.presync → openclaw.json,
      restart the gateway, exit non-zero naming the failed step (§5 step 6)
 ```
@@ -774,11 +825,12 @@ Notes:
   JSON5/manifest-heavy parts as an embedded node script run via the image, per
   §4.1), and keep `setup.sh --sync-agents` as a thin entry point that execs it.
   Don't inline it into setup.sh.
-- **Verify on the right surface.** The relay check uses the **headless one-shot**
-  (`docker compose run … dist/index.js agent --agent main …`), never the local
-  `chat` TUI — the TUI withholds `sessions_send`. (Same caveat the current
-  `--agents` docs already call out.) One-shot runs create fresh sessions, which
-  is also what picks up the new tool policy after the restart.
+- **Verify the event, not just the dispatch text.** The headless check creates
+  a fresh main session, asks it to spawn the specialist, then performs a bounded
+  sync-time scan for a source=subagent completion event followed by an
+  assistant token in main's transcript. The deployed coordinator itself never
+  polls files. Real provider delivery is separately exercised on a messaging
+  channel such as Discord.
 - **`--agents` becomes an alias.** The existing `--agents` flag turns into an
   alias for `--sync-agents` against the default committed manifest, and prints a
   one-line deprecation note. The default manifest's only entry is the reference
@@ -837,9 +889,10 @@ Notes:
 - **`echo-bot` → `examples/agents/echo-bot/`** — the reference package; the
   default manifest points at it via a local `source`; `--agents` becomes a
   deprecated alias for `--sync-agents` (§11).
-- **`tools.agentToAgent.allow` = explicit manifest id set** (not `"*"`) — least
-  privilege by default; it is a *target* allowlist (*verified*), so it holds the
-  specialist ids and the coordinator need not appear in it.
+- **`subagents.allowAgents` = explicit manifest specialist id set** (not `"*"`)
+  — least privilege for the active routing path. The legacy
+  `tools.agentToAgent.allow` contains both coordinator and specialists because
+  the pinned runtime requires caller and callee for `sessions_send`.
 - **`maxPingPongTurns` default `0`** — single exchange; raise to 1–2 only if
   specialists must ask clarifying questions.
 - **Skill deps: in-image `npm ci`, auto-detected** (§7.1) — any
