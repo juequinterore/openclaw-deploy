@@ -21,6 +21,7 @@ specialists" — that's a config feature of a *single* deployment (try
 ```
 docker-compose.yml          # vendored from upstream, pinned to tag v2026.6.11
 docker-compose.extra.yml    # our overrides: home volume, data-dir mounts, no ports
+docker-compose.dashboard.yml # opt-in: re-publish the gateway port to host loopback for the Control UI
 .env.example                # template — copy to .env and fill in
 .gitignore                  # excludes .env and .openclaw-data/
 setup.sh                    # automates "First-time setup" below; safe to re-run
@@ -133,6 +134,23 @@ docker compose run --rm --no-deps --entrypoint node openclaw-gateway \
   --non-interactive --accept-risk --auth-choice anthropic-cli \
   --gateway-bind loopback --skip-channels --skip-skills --skip-hooks --skip-search --skip-health
 docker compose run --rm openclaw-cli config set agents.defaults.model.primary anthropic/claude-sonnet-4-6
+```
+
+Pin the **full** `claude-cli` backend `args`/`resumeArgs`. Setting only
+`.command` above is not enough — without these launch flags the CLI process
+runs with no `--allowedTools mcp__openclaw__*` allowlist, so no OpenClaw MCP
+tools are exposed (a lone agent still answers, which masks the problem, but a
+coordinator has nothing to relay with). `setup.sh` does this automatically:
+```bash
+docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
+{
+  "agents": { "defaults": { "cliBackends": { "claude-cli": {
+    "command": "/home/node/.local/bin/claude",
+    "args": ["-p","--output-format","stream-json","--include-partial-messages","--verbose","--setting-sources","user","--allowedTools","mcp__openclaw__*","--disallowedTools","ScheduleWakeup,CronCreate,Bash(run_in_background:true),Monitor"],
+    "resumeArgs": ["-p","--output-format","stream-json","--include-partial-messages","--verbose","--setting-sources","user","--allowedTools","mcp__openclaw__*","--disallowedTools","ScheduleWakeup,CronCreate,Bash(run_in_background:true),Monitor","--resume","{sessionId}"]
+  } } } }
+}
+JSON
 docker compose restart openclaw-gateway
 ```
 
@@ -249,6 +267,17 @@ Adds, on top of the vendored base compose file:
   container's own network-namespace loopback, which a host port-publish
   can't reach anyway (Docker forwards to the container's non-loopback
   interface) — so publishing is both unreachable and unnecessary here.
+
+### `docker-compose.dashboard.yml` (opt-in)
+
+Not used by default. Re-publishes the gateway port that
+`docker-compose.extra.yml` clears (`ports: !reset []`), bound to the **host
+loopback only** (`127.0.0.1:18789`), so the Control UI / dashboard is reachable
+in a browser for local validation and never exposed off the machine. Requires
+`OPENCLAW_GATEWAY_BIND=lan` and appending it to `COMPOSE_FILE`. See "Validating
+the coordinator (dashboard vs. local TUI)" for the enable/revert steps. Never
+bind the Control UI to `0.0.0.0` — it's an admin surface (chat, config, exec
+approvals).
 
 ### `openclaw.json` (inside `.openclaw-data/config/`, not hand-edited directly)
 
@@ -414,8 +443,11 @@ docker compose run --rm -it --entrypoint sh openclaw-cli -lc \
 docker compose run --rm openclaw-cli config set \
   agents.defaults.cliBackends.claude-cli.command /home/node/.local/bin/claude
 ```
-Then wire up the agent runtime the same way as "First-time setup" above
-(the `onboard --auth-choice anthropic-cli` + model config commands).
+Then wire up the agent runtime the same way as "First-time setup" above — the
+`onboard --auth-choice anthropic-cli` + model config commands **and** the
+`config patch` that pins the full `claude-cli` `args`/`resumeArgs` (don't skip
+that last step: `.command` alone leaves the backend with no
+`mcp__openclaw__*` tools — see "First-time setup").
 </details>
 
 ### 5. Wire up Slack
