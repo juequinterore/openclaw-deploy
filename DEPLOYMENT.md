@@ -14,7 +14,7 @@ it once per agent — on the same VPS or on separate VPSs (see "Running multiple
 agents on one host"). For a single agent that transparently routes to persistent
 specialists behind one Slack channel, see "Single point of contact → persistent
 specialists" — that's a config feature of a *single* deployment (try
-`./setup.sh --agents`), not multiple deployments.
+`./setup.sh --sync-agents`), not multiple deployments.
 
 ## Repo structure
 
@@ -22,16 +22,31 @@ specialists" — that's a config feature of a *single* deployment (try
 docker-compose.yml          # vendored from upstream, pinned to tag v2026.6.11
 docker-compose.extra.yml    # our overrides: home volume, data-dir mounts, no ports
 docker-compose.dashboard.yml # opt-in: re-publish the gateway port to host loopback for the Control UI
+Dockerfile                  # optional: Python-enabled base image (see "Python & OS-level agent dependencies")
+pyhook/sitecustomize.py     # per-agent Python import hook baked into that image
 .env.example                # template — copy to .env and fill in
-.gitignore                  # excludes .env and .openclaw-data/
+.gitignore                  # excludes .env, .openclaw-data/, and .agents-src/
 setup.sh                    # automates "First-time setup" below; safe to re-run
+agents.manifest.json5        # declares pluggable agents for `setup.sh --sync-agents`
+scripts/sync-agents.sh       # implements --sync-agents (see AGENTS-PLUGINS.md)
+scripts/lib/manifest-compiler.js # its manifest/JSON5 logic, run inside the pinned image
+scripts/lib/manifest-compiler.test.js # unit tests for the compiler's pure functions
+scripts/test-compiler.sh     # runs the above inside the pinned image
+examples/agents/echo-bot     # reference agent package + the manifest's offline demo
+AGENTS-PLUGINS.md            # pluggable-agents format contract
+AGENTS-DEPS-SPEC.md          # Python/OS-level agent dependency extraction (extends AGENTS-PLUGINS.md §7)
 DEPLOYMENT.md                # this file
 ```
 
-No `Dockerfile`, no application source, nothing else — verified: `docker
-compose up -d` works from a directory containing only the compose files
-above, because `OPENCLAW_IMAGE` is pinned and already resolvable by tag, so Compose
-never touches the `build: .` fallback in `docker-compose.yml`.
+No application source beyond the pieces above — by default `docker compose up
+-d` needs only the compose files, because `OPENCLAW_IMAGE` is pinned and
+already resolvable by tag, so Compose never touches the `build: .` fallback in
+`docker-compose.yml`. `scripts/` and `examples/` are this deployment's own
+tooling, not a copy of upstream OpenClaw source. The one optional exception is
+`Dockerfile` — a thin, committed layer that adds Python on top of the stock
+image, needed only if a plugged-in agent (via `agents.manifest.json5`) ships
+Python dependencies; see "Python & OS-level agent dependencies" below. Skip it
+entirely if every agent you run is npm-only (or has none).
 
 ## Summary of this setup
 
@@ -450,6 +465,13 @@ that last step: `.command` alone leaves the backend with no
 `mcp__openclaw__*` tools — see "First-time setup").
 </details>
 
+**If you'll run `./setup.sh --sync-agents` with private git-sourced agents**
+(see "Single point of contact" below), the sync's `git fetch` runs as
+whatever host user invokes `setup.sh` — it doesn't manage credentials, so set
+up SSH agent forwarding, a deploy key, or a token-authenticated HTTPS remote
+for that user *before* syncing, same as any other private-repo `git` access
+on the VPS.
+
 ### 5. Wire up Slack
 Requires a Slack app with **Socket Mode** enabled — a bot token (`xoxb-...`)
 and an app-level token (`xapp-...`) from api.slack.com.
@@ -506,15 +528,15 @@ cd ../openclaw-sales  && ./setup.sh
   `docker compose config | grep -E 'name:|container_name'` in each directory
   should show distinct volume/container names.
 
-## Subagents: stateless parallel fan-out (optional)
+## Subagents: requester-aware background work
 
-Subagents are a *different* mechanism from the coordinator pattern below: a
-running agent spawns **ephemeral background runs** with `sessions_spawn` to
-parallelize discrete tasks. Use them for stateless fan-out (e.g. "review these
-five files at once"), **not** for a persistent front desk — for "one Slack
-contact routing to persistent specialists" use the relay pattern in "Single
-point of contact → persistent specialists" below (it keeps specialist memory
-and needs no elevated tool profile).
+Native subagents are the coordinator's active delegation mechanism. A running
+agent starts an isolated child with `sessions_spawn`; OpenClaw records the
+requester's session and delivery origin, so completion can resume the parent
+and be pushed back to the same Discord/Slack/etc. conversation. The generated
+coordinator ends its dispatch turn with a brief acknowledgement and does not
+wait — the completion event arrives on its own from the spawn. There is no
+`sessions_yield` call and no runtime polling loop.
 
 Enable it on the agent that will spawn. Note `sessions_spawn` requires the
 `coding` or `full` tool profile — a `messaging`-profile agent has no spawn tool:
@@ -536,140 +558,210 @@ Keep in mind:
 - **Optional sandboxing.** For sandboxed children (`sandbox: require`), uncomment
   the `/var/run/docker.sock` mount and `group_add`/`DOCKER_GID` block in
   `docker-compose.yml`. Not needed for the default (logical session isolation).
-- **Slack caveat.** Announce-back to the requester conversation works, but
-  persistent thread-binding of follow-ups to a specific subagent is
-  Discord/iMessage/Matrix/Telegram only — on Slack the parent re-dispatches each
-  turn. See `docs.openclaw.ai/tools/subagents`.
+- **Session semantics.** Each run has a fresh child transcript, but uses the
+  target agent's configured workspace, persona, skills, model, and persistent
+  workspace memory files.
+- **Thread caveat.** This deployment uses one-shot `mode:"run"` jobs. Persistent
+  thread-bound subagent sessions have separate channel support requirements and
+  are not part of the coordinator flow here.
 
-## Single point of contact → persistent specialists (coordinator pattern)
+## Single point of contact → requester-bound specialist jobs
 
-Goal: one Slack channel (or TUI session) where the user talks to a single "front
-desk" agent that routes each request to the right specialist — transparently,
-with specialists keeping their own memory across turns. This is a **single
-deployment** of this template: every agent runs in one gateway, shares one
-Claude CLI login, and adds no infrastructure.
+Goal: one Discord/Slack channel where the user talks to a single "front desk"
+agent that routes each request to the right specialist and posts the completed
+result automatically. This is a **single deployment** of this template: every
+agent runs in one gateway, shares one Claude CLI login, and adds no
+infrastructure.
 
-**The mechanism (what actually works on Slack):** the coordinator relays via
-**cross-agent messaging**, not subagent spawning. It calls `sessions_send` to
-hand the request to a specialist's own session (waiting for the reply), then
-relays that reply to the user in its normal channel message. Because the
-coordinator owns the outbound reply, this is channel-agnostic — no Slack
-thread-binding caveats.
+**The mechanism:** `main` starts the selected configured agent through
+`sessions_spawn` and ends the turn with a one-sentence acknowledgement — it
+never blocks or yields. The spawn registers the requester origin, so the child
+completion event wakes `main` on a later turn; `main` then relays the completed
+result to that origin with the channel-agnostic `message` tool and ends with
+`NO_REPLY`.
 
-> **Critical:** `sessions_send` is **not** part of the `messaging` (or any) tool
-> profile — a profile alone will **not** expose it, and the coordinator will
-> silently fall back to non-OpenClaw tooling and fail to route. You must grant it
-> explicitly on the coordinator with `tools.allow: ["sessions_list",
-> "sessions_history", "sessions_send"]`. This is the single most common reason a
-> coordinator "sees" its specialists (via the read tools) but never dispatches to
-> them.
+> **Critical:** `main` needs capabilities from two profiles: `sessions_spawn`
+> is a coding tool while `message` is a messaging tool. The sync uses
+> `profile:"full"` and then narrows it with an explicit allowlist —
+> `sessions_list`, `sessions_history`, `sessions_spawn`, `message`, plus
+> `sessions_send` **only** when at least one enabled specialist uses
+> `dispatch:"send"` (the default manifest's `echo-bot` does, so its allowlist
+> has five tools; a spawn-only deployment has four). It also generates
+> `subagents.allowAgents` from the enabled manifest ids. `sessions_yield` is
+> deliberately excluded — on sonnet-5 the model treated it as "wait silently"
+> and suppressed the acknowledgement with `NO_REPLY`.
 
-### Quickest path: `./setup.sh --agents`
+### Quickest path: `./setup.sh --sync-agents`
 
-Re-run setup with the flag to scaffold a working coordinator plus a throwaway
-`echo-bot` specialist, wired with the enabling keys:
-
-```bash
-./setup.sh --agents
-```
-
-It's idempotent — if agents are already configured (`tools.agentToAgent.enabled`
-is `true`) it skips the scaffold. It provisions:
-
-- **`main`** — the coordinator: `default: true` (front door for unrouted
-  messages), with `tools.allow: [sessions_list, sessions_history, sessions_send]`
-  (explicitly granting the relay tool — no profile), and an `AGENTS.md` telling it
-  to relay echo requests to `echo-bot` via `sessions_send`.
-- **`echo-bot`** — a persistent specialist whose replies start with the sentinel
-  `ECHO-BOT>>`.
-- the three enabling keys (below), and it verifies `echo-bot` responds before
-  finishing.
-
-Then confirm dispatch (no Slack needed). Use a **fresh `--session`** — existing
-sessions load their persona at creation, so one created before the scaffold (the
-setup verify's `main` session) won't have the coordinator instructions and will
-just answer directly:
+Agents are **declared in `agents.manifest.json5`** (committed at the repo
+root) and wired in by re-running setup with the flag:
 
 ```bash
-docker compose run --rm -it openclaw-cli chat --session desk1
-#   › echo: banana
-#   › expect the reply to contain  ECHO-BOT>> banana   (main relayed it)
+./setup.sh --sync-agents
 ```
+
+This is the **pluggable agents** mechanism — full contract in
+`AGENTS-PLUGINS.md`. In short: each manifest entry points at an agent
+*package* (a git repo pinned to a ref, or a local path for the dev loop),
+`--sync-agents` fetches it, materializes its `workspace/` into this
+deployment, and **regenerates the entire `agents.list`** (plus the enabling
+keys below) from the manifest in one atomic, validated `config patch`. The
+manifest is the single source of truth: hand-added agents.list entries that
+the sync doesn't recognize make it abort (see "Foreign agents" below), and
+removing a manifest entry and re-syncing drops it cleanly, no residue.
+
+The default manifest has one entry — the reference/demo package at
+`examples/agents/echo-bot`, a local path so a fresh clone works offline:
+
+```json5
+// agents.manifest.json5
+{
+  agents: [
+    { source: "examples/agents/echo-bot", ref: null },
+  ],
+}
+```
+
+`--sync-agents` is idempotent (re-running with an unchanged manifest is a
+no-op patch) but **not silent**: it always restarts the gateway to apply the
+new tool policy, which **interrupts any live sessions** — run it during a
+quiet window on a box serving real Slack traffic.
+
+Confirm the full lifecycle on a real messaging channel with a **fresh
+conversation** (`/new` on Discord, then send an echo request). Existing
+sessions retain the tool policy/persona they were created with. The sync also
+runs a headless event-level smoke check, but a detached CLI process is not a
+substitute for provider delivery.
 
 ### What gets configured (and why)
 
-The scaffold applies this via `config patch` (validated merge), using the
-container's mounted paths:
+`--sync-agents` assembles this via `config patch --replace-path agents.list`
+(dry-run validated first), using the container's mounted paths — shown here
+for the default manifest (one specialist, `echo-bot`):
 
 ```json5
 {
   agents: {
-    defaults: { /* model + claude-cli runtime from setup.sh — leave as-is */ },
     list: [
       { id: "main", default: true,           // front door: unrouted messages land here
-        tools: { allow: ["sessions_list", "sessions_history", "sessions_send"] }, // grant the relay tool explicitly
+        tools: {
+          profile: "full",
+          // sessions_send is added ONLY when a dispatch:"send" specialist
+          // exists (echo-bot is one in the default manifest); a spawn-only
+          // deployment drops it. sessions_yield is never granted.
+          allow: ["sessions_list", "sessions_history", "sessions_spawn",
+                  "sessions_send", "message"]
+        },
+        subagents: {
+          delegationMode: "prefer",
+          allowAgents: ["echo-bot"]
+        },
         workspace: "/home/node/.openclaw/workspace" },
-      { id: "echo-bot",                        // a persistent specialist (own session/memory)
-        tools: { profile: "messaging" },       // specialists that touch files/exec use "coding"
-        workspace: "/home/node/.openclaw/agents/echo-bot/workspace" }
-    ]
+      { id: "echo-bot",                        // configured specialist agent
+        workspace: "/home/node/.openclaw/agents/echo-bot/workspace",
+        agentDir: "/home/node/.openclaw/agents/echo-bot/agent",  // runtime state, outside the workspace
+        name: "🔁 Echo Bot", identity: { emoji: "🔁" },
+        tools: { profile: "messaging" } }      // specialists that touch files/exec use "coding"
+    ],
+    defaults: {
+      skipBootstrap: true,                     // pre-seeded agents ship their own persona
+      subagents: { runTimeoutSeconds: 180 }    // largest specialist timeoutMs
+    }
   },
   tools: {
     sessions:     { visibility: "all" },       // let main see/target other agents' sessions
-    agentToAgent: { enabled: true, allow: ["*"] } // permit cross-agent calls; scope `allow` to tighten
+    agentToAgent: { enabled: true, allow: ["main", "echo-bot"] } // BOTH caller and callee ids — explicit, not "*"
   },
-  session: { agentToAgent: { maxPingPongTurns: 2 } } // reply-back turns (0-20; 0 = single exchange)
+  session: { agentToAgent: { maxPingPongTurns: 0 } } // reply-back turns (0-20; 0 = single exchange)
 }
 ```
 
-The four enabling keys, verified against `openclaw config schema`:
+The sync-owned enabling keys, verified against `openclaw config schema`:
 
-- **`agents.list[main].tools.allow` includes `sessions_send`** — the coordinator
-  can only relay if the tool is explicitly granted. `sessions_send` is in **no**
-  profile, so `tools.profile` alone leaves the coordinator unable to dispatch.
-  This is the key most easily missed.
-- **`tools.sessions.visibility: "all"`** — scope for `sessions_list/history/send`
+- **`agents.list[main].tools` spans spawn + message and is then narrowed** —
+  `profile:"full"` passes the profile filter for both coding (`sessions_spawn`)
+  and messaging (`message`) capabilities; the allowlist leaves only the
+  coordinator tools. `sessions_send` is appended only when a `dispatch:"send"`
+  specialist is enabled. `sessions_yield` is deliberately excluded — on sonnet-5
+  it lured the model into ending the dispatch turn with `NO_REPLY`, suppressing
+  the acknowledgement.
+- **`agents.list[main].subagents.allowAgents`** — explicit enabled specialist
+  ids, never `"*"`.
+- **`agents.defaults.subagents.runTimeoutSeconds`** — largest enabled
+  specialist `timeoutMs`, rounded up because native spawn has no per-call
+  timeout.
+- **`tools.sessions.visibility: "all"`** — scope for user-requested
+  `sessions_list/history`
   (`self` < `tree` (default) < `agent` < `all`). `all` lets the coordinator
-  target other agents' sessions.
-- **`tools.agentToAgent.enabled: true` + `allow: ["*"]`** — permits an agent to
-  invoke another at runtime; `allow` is the target allowlist (use explicit ids
-  to tighten).
+  inspect the child session key returned by a prior spawn when the user asks.
+- **`tools.agentToAgent` / `session.agentToAgent`** remain explicit for
+  backward-compatible manual inter-session use, but are not the active
+  requester-delivery path.
 - **`session.agentToAgent.maxPingPongTurns`** — after the specialist replies, how
-  many reply-back turns the two agents may alternate (0–20, default 5). `0` =
-  one exchange, no follow-up loop.
+  many reply-back turns the two agents may alternate (0–20). `0` (the manifest's
+  default) = one exchange, no follow-up loop; set `coordinator.maxPingPongTurns`
+  in the manifest to raise it.
+- **`agents.defaults.skipBootstrap: true`** — pre-seeded agents ship their
+  persona already, so the interactive first-run bootstrap ritual is skipped.
 
-Routing is **prompt-driven**: the coordinator's `AGENTS.md` says which specialist
-handles what and to reach it with `sessions_send` (wait mode). The keys grant the
-capability; the persona makes the call.
+Routing is **prompt-driven**: the coordinator's `AGENTS.md` is **generated**
+from the manifest (routing table row per agent, from its `role`/`routeHint`) —
+see `AGENTS-PLUGINS.md` §8. It's overwritten on every sync; to change routing,
+edit the manifest and re-sync, don't hand-edit the file.
+
+**Foreign agents:** if `agents.list` currently contains an entry that's
+neither the coordinator nor produced by the manifest (a hand-added agent, or
+one whose id you dropped from the manifest but whose workspace doesn't match
+the sync-owned path convention), the sync **aborts** and lists it. Either add
+it to the manifest, or confirm its removal with `./setup.sh --sync-agents
+--prune`.
+
+**Migrating from the old `--agents` scaffold:** `--agents` is now a
+deprecated alias for `--sync-agents` against the default manifest. Since the
+default manifest's only entry is the same `echo-bot` demo (now sourced from
+`examples/agents/echo-bot` instead of hardcoded), migration is automatic and
+in-place. The active coordinator path changes from a shared
+`agent:<id>:main` `sessions_send` exchange to an isolated requester-aware
+subagent job. `tools.agentToAgent.allow` also tightens from `["*"]` to explicit
+ids, and `session.agentToAgent.maxPingPongTurns` changes from `2` to `0`. The
+coordinator's hand-editable `AGENTS.md` becomes fully sync-owned (overwritten
+on every sync going forward).
 
 ### How the round-trip works
 
-1. The user messages the coordinator (the `default` agent) on Slack or in the TUI.
-2. The coordinator picks a specialist and calls `sessions_send(key="agent:<id>:main",
-   message=request, timeoutMs=<wait>)`. A standing agent's session key has the form
-   `agent:<id>:main` (e.g. `agent:echo-bot:main`).
-3. The specialist runs in **its own persistent session** (keeps memory across
-   calls) and returns its answer inline to the coordinator.
-4. The coordinator relays that answer to the user in its own channel reply — the
-   user sees one bot.
+1. The user messages `main` on Discord/Slack/etc.
+2. `main` picks a specialist and calls `sessions_spawn(agentId="<id>",
+   mode="run", task=request)`.
+3. The gateway registers the child with the requester session plus its
+   channel/account/target. `main` ends the turn with a one-sentence
+   acknowledgement — it does not yield or otherwise wait.
+4. The specialist runs in an isolated child session using its own configured
+   workspace/persona/skills/model.
+5. The child completion event resumes `main` on a later turn; `main` relays the
+   actual child result to the registered requester via the `message` tool and
+   ends with `NO_REPLY`.
 
-### Validating the coordinator (dashboard vs. local TUI)
+### Validating the coordinator
 
-**Do not test the coordinator from the local `chat` TUI.** The interactive TUI
-registers as a restricted Gateway client and **withholds `sessions_send`** — you
-will see only `sessions_list`/`sessions_history`, and `main` reports that
-`sessions_send` "isn't available". Cross-session tools are exposed on the
-surfaces that matter — **headless `agent` runs, the dashboard, and Slack** — not
-the local TUI. (This is easy to mistake for a broken config; it isn't.)
+Use a real messaging channel for the complete push lifecycle. A local TUI or a
+detached headless client can dispatch work, but it is not an external
+conversation that can receive a later provider message after the client exits.
 
 Two ways to validate:
 
-- **Headless one-shot** — the same check `setup.sh --agents` runs:
+- **Discord/Slack** — start a fresh conversation and ask for an echo. Expect
+  two bot messages: a working acknowledgement, then the completed echo result.
+
+- **Headless event smoke** — `setup.sh --sync-agents` creates a fresh session,
+  dispatches echo, and verifies in main's transcript that a
+  `source: subagent` completion event was followed by the expected assistant
+  token. This proves event routing, but not provider delivery. To dispatch by
+  hand:
   ```bash
   docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
-    --agent main --message "echo: banana" --json --timeout 120
+    --agent main --message "Please have the echo specialist repeat back: banana" \
+    --json --timeout 120
   ```
-  Expect `ECHO-BOT>>` in the output.
 
 - **Dashboard (Control UI)** — to drive it by hand. The template binds the
   gateway to loopback with no published port, so the dashboard is unreachable by
@@ -694,30 +786,96 @@ Two ways to validate:
 
 ### Adding real specialists
 
-1. Add an `agents.list[]` entry with its own `id`, an `identity.name`, a
-   `workspace` under `/home/node/.openclaw/...`, and a `tools.profile` (`coding`
-   if it needs files/exec, `messaging` if it only talks). Add its id to
-   `tools.agentToAgent.allow` unless you keep `["*"]`. `config patch` **replaces**
-   the whole `agents.list`, so include every agent you want to keep (check
-   `config get agents.list` first):
-   ```bash
-   docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
-   { "agents": { "list": [
-     { "id": "main", "default": true, "tools": { "profile": "messaging" }, "workspace": "/home/node/.openclaw/workspace" },
-     { "id": "billing", "tools": { "profile": "coding" }, "identity": { "name": "Billing" },
-       "workspace": "/home/node/.openclaw/agents/billing/workspace" }
-   ] } }
-   JSON
-   docker compose run --rm openclaw-cli config validate
+Add an entry to `agents.manifest.json5` and re-sync — see `AGENTS-PLUGINS.md`
+for the full package contract (a git repo with `openclaw.agent.json5` +
+`workspace/AGENTS.md`) and every field a manifest entry accepts.
+
+1. **Author or point at an agent package.** For the dev loop, a local path
+   works and needs no `openclaw.agent.json5` (the "Model B" fallback) as long
+   as you declare `id`/`tools`/etc. inline:
+   ```json5
+   // agents.manifest.json5
+   {
+     agents: [
+       { source: "examples/agents/echo-bot", ref: null },
+       { source: "../my-billing-agent", ref: null,
+         id: "billing", name: "Billing", role: "Invoices, refunds, payment disputes.",
+         tools: { profile: "coding" } },
+     ],
+   }
    ```
-2. Write the specialist's persona (its job) and add the routing rule to the
-   coordinator's `AGENTS.md`, both from inside the container (uid 1000):
-   ```bash
-   docker compose run --rm --entrypoint sh openclaw-cli -lc '
-     d=/home/node/.openclaw/agents/billing/workspace; mkdir -p "$d";
-     printf "%s\n" "# Billing specialist" "You answer billing questions. Be concise." > "$d/AGENTS.md" '
-   docker compose restart openclaw-gateway
+   For a package maintained in its own repo, pin a **tag or SHA** (not a
+   branch — the sync warns if it looks like one):
+   ```json5
+   { source: "git@github.com:acme/openclaw-billing.git", ref: "v1.2.0" },
    ```
+   **Private repos on a VPS** need host git auth (SSH agent, deploy key, or
+   token) for whatever user runs `./setup.sh --sync-agents` — the sync only
+   invokes `git`, it doesn't manage credentials.
+2. **Sync:**
+   ```bash
+   ./setup.sh --sync-agents
+   ```
+   This fetches the package, lints it, materializes its `workspace/` under
+   `.openclaw-data/config/agents/billing/workspace/`, rebuilds `agents.list`
+   (keeping every previously-synced agent — nothing to hand-merge), restarts
+   the gateway, and verifies each specialist responds plus that the
+   coordinator relays to one of them. On any failure it rolls `openclaw.json`
+   back and restarts again, so a bad sync doesn't leave the box half-configured.
+3. Bump a `ref` and re-sync to update a specialist later — its persona/tools
+   refresh but its accumulated memory (anything past the seed `MEMORY.md`) is
+   preserved.
+
+### Python & OS-level agent dependencies
+
+A plugged-in agent may ship Python code (`pyproject.toml`/`requirements*.txt`)
+alongside or instead of npm skills — auto-extracted the same way, symmetric
+with npm (full design + live verification: `AGENTS-DEPS-SPEC.md`; contract
+summary: `AGENTS-PLUGINS.md` §7.3/§7.4).
+
+**Only matters if an agent you plug in actually has Python deps.** The stock
+image has no `pip`, so nothing below is needed for an npm-only (or
+dependency-free) agent like `echo-bot`.
+
+1. **Build the Python-enabled base image once, locally:**
+   ```bash
+   # In .env, point OPENCLAW_IMAGE at a LOCAL tag — NOT the literal
+   # "openclaw:local" sentinel setup.sh's preflight rejects as "unset":
+   OPENCLAW_IMAGE=openclaw-deploy-py:2026.6.11
+
+   docker compose build
+   docker compose up -d openclaw-gateway
+   ```
+   This builds the committed `Dockerfile` (pip + `python-is-python3` + the
+   per-agent `pyhook/sitecustomize.py` import hook — see `AGENTS-DEPS-SPEC.md`
+   §3.4/§5), FROM the same pinned upstream tag this repo already tracks. Keep
+   the `Dockerfile`'s `FROM` tag and this `OPENCLAW_IMAGE` value in sync when
+   you bump versions (same ritual as "Updating the image version" above).
+2. **Ship a fully `==`-pinned lock if you want reproducible installs** —
+   `requirements.lock`, or a `requirements.txt` that's itself the output of
+   `pip freeze` / `pip-compile` / `uv pip compile`. This is recommended but no
+   longer required (revised 2026-07-16): an agent that ships only a
+   `pyproject.toml` with version ranges (or an unpinned `requirements.txt`) now
+   syncs anyway — the sync resolves its declared deps and **warns** that the
+   install isn't byte-reproducible across hosts/time, rather than failing.
+   (npm still requires its `package-lock.json`; see `AGENTS-DEPS-SPEC.md` §3.2
+   for why Python differs.)
+3. **Sync as usual** (`./setup.sh --sync-agents`) — it installs each agent's
+   deps into its own `<workspace>/.python-site` (never a shared/merged
+   install; two agents can pin conflicting versions with no collision).
+4. **OS-level packages** (a native library, a Playwright browser) are not
+   auto-extractable — a package requests them via `system.apt` /
+   `system.playwrightBrowsers` in its `openclaw.agent.json5`, but they only
+   take effect on a manifest entry with `allowSystemDeps: true`:
+   ```json5
+   { source: "git@github.com:acme/openclaw-scraper.git", ref: "v1.0.0",
+     allowSystemDeps: true },
+   ```
+   The sync never builds the image itself — it validates the running image
+   and, on any miss, **aborts before touching config**, printing the exact
+   lines to append to the `Dockerfile`'s "OS deps requested by plugged-in
+   agents" section and the rebuild command from step 1. Append, rebuild,
+   re-run the sync.
 
 ### Prefer to route by identity instead of content?
 
@@ -744,15 +902,23 @@ See `docs.openclaw.ai/tools/subagents`.
 
 ### Things to review
 
-- **Routing quality** is only as good as the coordinator's `AGENTS.md` — be
-  explicit about which specialist owns which kind of request.
-- **Breadth:** `allow: ["*"]` and `visibility: "all"` are wide open — fine for a
-  single-operator box; scope `allow` to explicit ids for least privilege.
-- **`maxPingPongTurns: 0`** blocks a specialist from asking the coordinator a
-  clarifying follow-up; use 1–2 if specialists need to round-trip.
+- **Routing quality** is only as good as each entry's `role`/`routeHint` in
+  `agents.manifest.json5` — the coordinator's `AGENTS.md` routing table is
+  generated straight from it, so be specific there.
+- **Breadth:** `visibility: "all"` is wide open (fine for a single-operator
+  box); `tools.agentToAgent.allow` is already the coordinator plus explicit
+  enabled-agent ids by default, not `"*"`.
+- **`maxPingPongTurns: 0`** (the manifest default) blocks a specialist from
+  asking the coordinator a clarifying follow-up; set
+  `coordinator.maxPingPongTurns` to `1` or `2` in the manifest if specialists
+  need to round-trip.
 - **Sizing:** each active agent is another concurrent `claude` process in the one
   container — size the VPS, and point cheaper specialists at cheaper models
-  per-agent (`agents.list[].model`).
+  per-agent (a `model` override in the manifest, or the package's own `model`).
+- **Capability subtraction:** plugging in an agent built for a bigger
+  environment? Use the manifest's `disableSkills`/`denyTools` to narrow it for
+  this box rather than editing the package — see "Capability subtraction" in
+  `AGENTS-PLUGINS.md` §7.
 
 ## Troubleshooting notes learned while setting this up
 
@@ -797,11 +963,11 @@ See `docs.openclaw.ai/tools/subagents`.
   `agents.defaults`, which is a closed object. `agents.list` is a sibling of
   `agents.defaults`, and `bindings` is a top-level key. The gateway kept the
   previous valid config (nothing broke). Move the keys to the right level (see
-  "Single point of contact → persistent specialists"), or apply via `config
+  "Single point of contact → requester-bound specialist jobs"), or apply via `config
   patch`, then `config validate` before restarting. Inspect the real schema any
   time with `docker compose run --rm openclaw-cli config schema`.
 - **Coordinator says `sessions_spawn` isn't available (only `sessions_list` /
-  `sessions_history` / `sessions_yield`)** — its tool profile doesn't include
+  `sessions_history`)** — its tool profile doesn't include
   the spawn tool. `sessions_spawn` is in the `coding`/`full` profiles only; a
   messaging/default-profile agent never gets it. Set
   `agents.list[main].tools.profile: "full"` and restart. Verify inside the TUI
@@ -820,11 +986,15 @@ See `docs.openclaw.ai/tools/subagents`.
   (e.g. the `main` session from setup's verify step, recognizable by leftover
   `SETUP_SCRIPT_OK` history). Sessions load their agent persona at creation.
   Start a fresh one: `docker compose run --rm -it openclaw-cli chat --session
-  desk1`. If a brand-new session still won't relay, force the tool to isolate
-  the cause: `Use the sessions_send tool to send "banana" to agent "echo-bot",
-  wait for the reply, and return it` — a working result means it's persona
-  wording, not plumbing.
-- **This repo has no `Dockerfile` and no application source, on purpose** —
-  don't `git clone` the full `openclaw/openclaw` project expecting to find
-  more here; everything needed to run is in this repo (the two compose files
-  plus your `.env`) alongside the pulled image.
+  desk1`. If a brand-new provider conversation still won't delegate, force the
+  tool to isolate the cause:
+  `Use sessions_spawn with agentId "echo-bot" to run: echo banana` — a child
+  completion event means the plumbing works and the remaining issue is
+  persona/provider delivery.
+- **This repo has no application source, on purpose** — don't `git clone` the
+  full `openclaw/openclaw` project expecting to find more here; everything
+  needed to run is in this repo (the compose files plus your `.env`) alongside
+  the pulled image. The one committed `Dockerfile` is a thin, optional layer
+  that adds Python on top of that pulled image (see "Python & OS-level agent
+  dependencies") — it is not a copy of upstream source, and most deployments
+  never need to build it.

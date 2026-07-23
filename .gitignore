@@ -3,3 +3,7 @@
 # Local reference copy of a partner's multi-agent deployment (has its own .env
 # with real secrets). Kept for study; must never be committed.
 openclaw_session_complex/
+# Pluggable-agents staging checkouts (AGENTS-PLUGINS.md §6) — fetched by
+# `setup.sh --sync-agents`, never committed. Materialized workspaces land in
+# the already-ignored .openclaw-data/ instead.
+/.agents-src/

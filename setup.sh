@@ -14,12 +14,22 @@ log()  { printf '\n\033[1;36m==>\033[0m %s\n' "$1"; }
 fail() { printf '\033[1;31mERROR:\033[0m %s\n' "$1" >&2; exit 1; }
 
 # --- args ---------------------------------------------------------------
-WITH_AGENTS=0
+SYNC_AGENTS=0
+PRUNE_ARGS=()
 for arg in "$@"; do
   case "$arg" in
-    --agents|--with-agents) WITH_AGENTS=1 ;;
+    --sync-agents) SYNC_AGENTS=1 ;;
+    --prune) PRUNE_ARGS+=(--prune) ;;
+    --agents|--with-agents)
+      SYNC_AGENTS=1
+      echo "NOTE: --agents is deprecated, use --sync-agents instead (it now syncs" >&2
+      echo "      agents.manifest.json5, not a hardcoded echo-bot scaffold — the default" >&2
+      echo "      manifest still points at the same echo-bot demo, so this keeps working," >&2
+      echo "      but coordinator delegation now uses requester-aware native subagents." >&2
+      echo "      See \"Single point of contact\" in DEPLOYMENT.md." >&2
+      ;;
     -h|--help)
-      printf 'Usage: ./setup.sh [--agents]\n\n  --agents  After the base setup, scaffold a coordinator (main) plus a\n            persistent echo-bot specialist wired for cross-agent messaging\n            (sessions_send + tools.agentToAgent). Idempotent; skips if agents\n            are already configured. See "Single point of contact" in\n            DEPLOYMENT.md.\n'
+      printf 'Usage: ./setup.sh [--sync-agents [--prune]]\n\n  --sync-agents  After the base setup, sync the agents declared in\n                 agents.manifest.json5 into the running gateway, behind a\n                 coordinator (sessions_spawn + requester-bound completion).\n                 Idempotent. See AGENTS-PLUGINS.md and "Single point of\n                 contact" in DEPLOYMENT.md.\n  --prune        With --sync-agents: confirm removal of agents.list entries\n                 that are neither the coordinator nor produced by the\n                 manifest (otherwise the sync aborts and lists them).\n  --agents       Deprecated alias for --sync-agents.\n'
       exit 0 ;;
     *) fail "Unknown argument: $arg (try --help)" ;;
   esac
@@ -73,9 +83,20 @@ for var in OPENCLAW_IMAGE OPENCLAW_CONFIG_DIR OPENCLAW_WORKSPACE_DIR \
   grep -qE "^${var}=.+" .env || fail "$var is not set in .env. Edit it manually (see .env.example), then re-run this script."
 done
 
-# --- 2. Pull image -------------------------------------------------------
-log "Pulling pinned OpenClaw image"
-docker compose pull openclaw-gateway
+# --- 2. Get the image ----------------------------------------------------
+# OPENCLAW_IMAGE is either a real published tag (pull it) or a locally-built
+# one, e.g. this repo's own Dockerfile adding Python/Playwright for plugged-in
+# agents (DEPLOYMENT.md "Python & OS-level agent dependencies") — nothing to
+# pull for that case, so fall back to building it from the committed
+# Dockerfile. This keeps the fast path for a stock deployment while making a
+# local-image deployment reproducible on any machine, not just the one it was
+# first built on.
+log "Fetching the OpenClaw image"
+if ! docker compose pull openclaw-gateway; then
+  log "Pull failed — falling back to building locally from the committed Dockerfile (expected if OPENCLAW_IMAGE is a local-only tag, not a published one)"
+  docker compose build openclaw-gateway ||
+    fail "Could not pull or build the OpenClaw image. Check OPENCLAW_IMAGE in .env, your network connection, and (if building) the Dockerfile."
+fi
 IMAGE_RESOLVED=$(docker compose config 2>/dev/null | grep -m1 'image:' | awk '{print $2}')
 [[ "$IMAGE_RESOLVED" != "openclaw:local" ]] || fail "OPENCLAW_IMAGE still resolves to openclaw:local — check .env."
 
@@ -83,11 +104,14 @@ IMAGE_RESOLVED=$(docker compose config 2>/dev/null | grep -m1 'image:' | awk '{p
 log "Creating data directories"
 mkdir -p .openclaw-data/config .openclaw-data/workspace .openclaw-data/auth-secrets
 if [[ "$(uname -s)" == "Linux" ]]; then
-  log "Linux detected: chowning data dirs to uid 1000 (the container's node user)"
-  if [[ "$(id -u)" -eq 0 ]]; then
-    chown -R 1000:1000 .openclaw-data
-  else
-    sudo chown -R 1000:1000 .openclaw-data
+  # Skip the chown (and its sudo prompt) when ownership is already right —
+  if [[ -n "$(find .openclaw-data ! \( -uid 1000 -gid 1000 \) -print -quit)" ]]; then
+    log "Linux detected: chowning data dirs to uid 1000 (the container's node user)"
+    if [[ "$(id -u)" -eq 0 ]]; then
+      chown -R 1000:1000 .openclaw-data
+    else
+      sudo chown -R 1000:1000 .openclaw-data
+    fi
   fi
 fi
 
@@ -150,9 +174,9 @@ docker compose run --rm --no-deps --entrypoint node openclaw-gateway \
   --non-interactive --accept-risk --auth-choice anthropic-cli \
   --gateway-bind loopback --skip-channels --skip-skills --skip-hooks --skip-search --skip-health
 
-log "Setting default model to anthropic/claude-sonnet-4-6"
+log "Setting default model to anthropic/claude-sonnet-5"
 docker compose run --rm openclaw-cli config set \
-  agents.defaults.model.primary anthropic/claude-sonnet-4-6
+  agents.defaults.model.primary anthropic/claude-sonnet-5
 
 # Pin the FULL claude-cli backend. Setting only `.command` leaves the backend
 # without its `args`, so agents launch with no `--allowedTools mcp__openclaw__*`
@@ -186,67 +210,13 @@ else
 $RESULT"
 fi
 
-# --- 9. Optional: scaffold the multi-agent coordinator (--agents) ---------
-if [[ "$WITH_AGENTS" -eq 1 ]]; then
-  log "Scaffolding multi-agent coordinator (--agents)"
-  # Idempotency probe reads the config file directly. Do NOT parse `config get`
-  # stdout here: it prints a banner, and (worse) its non-zero exit when the key
-  # is unset would abort this script under `set -e`/`pipefail` — an `if grep`
-  # condition is exempt from errexit and can't take the script down.
-  if grep -q '"agentToAgent"' .openclaw-data/config/openclaw.json 2>/dev/null; then
-    log "Agents already configured (agentToAgent present) — skipping scaffold"
+# --- 9. Optional: sync pluggable agents behind the coordinator ------------
+if [[ "$SYNC_AGENTS" -eq 1 ]]; then
+  log "Syncing agents (agents.manifest.json5)"
+  if [[ "${#PRUNE_ARGS[@]}" -gt 0 ]]; then
+    "$SCRIPT_DIR/scripts/sync-agents.sh" "${PRUNE_ARGS[@]}"
   else
-    log "Applying coordinator + echo-bot config"
-    docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
-{
-  "agents": { "list": [
-    { "id": "main", "default": true,
-      "tools": { "allow": ["sessions_list", "sessions_history", "sessions_send"] },
-      "workspace": "/home/node/.openclaw/workspace" },
-    { "id": "echo-bot", "tools": { "profile": "messaging" },
-      "workspace": "/home/node/.openclaw/agents/echo-bot/workspace" }
-  ] },
-  "tools": {
-    "sessions": { "visibility": "all" },
-    "agentToAgent": { "enabled": true, "allow": ["*"] }
-  },
-  "session": { "agentToAgent": { "maxPingPongTurns": 2 } }
-}
-JSON
-    log "Writing coordinator + echo-bot personas (owned by uid 1000)"
-    docker compose run --rm --entrypoint sh openclaw-cli -lc '
-      m=/home/node/.openclaw/workspace; mkdir -p "$m";
-      printf "%s\n" "# Front desk (coordinator)" \
-        "You are a thin router. Never do specialist work yourself." \
-        "A specialist session key has the form agent:<id>:main." \
-        "RULE: Any message beginning with \"echo:\" MUST be relayed to echo-bot. Call sessions_send(key=\"agent:echo-bot:main\", message=\"<text after echo:>\", timeoutMs=120000) and return the reply from echo-bot verbatim. Never echo it yourself, even one word." > "$m/AGENTS.md";
-      e=/home/node/.openclaw/agents/echo-bot/workspace; mkdir -p "$e";
-      printf "%s\n" "# echo-bot" \
-        "You are a test specialist. Reply to EVERY message with exactly:" \
-        "ECHO-BOT>> <repeat the user message verbatim>" > "$e/AGENTS.md" '
-    docker compose run --rm openclaw-cli config validate
-    docker compose restart openclaw-gateway
-    sleep 5
-    log "Verifying the echo-bot specialist responds"
-    ER=$(docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
-      --agent echo-bot --message "banana" --json --timeout 60)
-    if [[ "$ER" == *'ECHO-BOT>>'* ]]; then
-      log "echo-bot OK. Verifying the coordinator relays to it via sessions_send"
-      # A one-shot `agent` run starts a fresh session, so main loads its
-      # coordinator persona (existing chat sessions predate it and won't relay).
-      CR=$(docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
-        --agent main --message "echo: banana" --json --timeout 120)
-      if [[ "$CR" == *'ECHO-BOT>>'* ]]; then
-        log "Coordinator relay OK — main delegated to echo-bot and returned its reply."
-      else
-        log "WARNING: coordinator did not relay (no ECHO-BOT>> in its reply). Confirm main's"
-        log "tools.allow includes sessions_send and that its AGENTS.md loaded. Full output:"
-        log "$CR"
-      fi
-    else
-      fail "echo-bot did not respond as expected. Full output:
-$ER"
-    fi
+    "$SCRIPT_DIR/scripts/sync-agents.sh"
   fi
 fi
 

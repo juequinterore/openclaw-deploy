@@ -1,0 +1,143 @@
+# Slack app manifest template for an OpenClaw agent deployment.
+#
+# Unrelated to agents.manifest.json5 (that one governs which specialist agents
+# run inside OpenClaw). This is Slack's own app manifest, pasted into
+# api.slack.com/apps -> "Create New App" -> "From an app manifest".
+#
+# Per DEPLOYMENT.md, each agent deployment gets its OWN Slack app (own bot +
+# app token, no shared routing). Copy this file per agent, fill in the name/
+# description, and comment out the block(s) you don't need -- see notes below.
+#
+# After editing scopes/features on an app that already exists, changes only
+# take effect after "Reinstall to Workspace" (OAuth & Permissions), which also
+# rotates the bot token -- update it wherever it's configured
+# (`docker compose run --rm openclaw-cli channels add --channel slack ...`).
+
+display_information:
+  name: openclaw-agent   # e.g. "Sallie - OC" -- pick something recognizable
+  description: ""        # short description shown in the app directory/profile (max 140 chars)
+  background_color: "#1f2937"
+
+features:
+  bot_user:
+    display_name: openclaw-agent
+    always_online: false
+
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    # This is the "Allow users to send Slash commands and messages from the
+    # messages tab" checkbox. Leave false (i.e. NOT read-only) or the DM
+    # compose box shows "Sending messages to this app has been turned off."
+    messages_tab_read_only_enabled: false
+
+  # --- OPTIONAL: Slack "AI Assistant" surface (OFF by default) --------------
+  # Adds the Assistant side panel + "New chat" button. Uncomment the
+  # `assistant_view` block below AND the matching `assistant:write` scope to
+  # turn it on -- but ONLY if the runtime handles the assistant flow (see
+  # below), otherwise the panel opens a conversation the bot never
+  # acknowledges. It is a different integration surface, not just cosmetic, so
+  # it ships disabled: a plain conversational bot (Messages tab DM/mention
+  # flow) needs none of it.
+  #
+  # DEPRECATION NOTICE (per https://docs.slack.dev/ai/developing-agents/#migrating):
+  # Slack is deprecating assistant_view in favor of "agent_view" (the Agent
+  # messaging experience -- conversations live in the Messages tab instead of
+  # separate Chat/History tabs). Migrating means renaming this block to
+  # agent_view and assistant_description to agent_description, AND replacing
+  # the assistant_thread_started/assistant_thread_context_changed handlers
+  # with an app_home_opened handler that checks event.tab === "messages".
+  # Either way, this is NOT cosmetic-only: verify the gateway/runtime you're
+  # deploying actually implements the relevant event handlers before enabling
+  # this block. The openclaw gateway image this template deploys does not
+  # confirm supporting either surface, so it is left out by default.
+  # assistant_view:
+  #   assistant_description: "One-line description shown in the assistant panel"
+  #   suggested_prompts: []
+
+oauth_config:
+  scopes:
+    bot:
+      # --- Core messaging (always needed) ---------------------------------
+      - chat:write
+      - app_mentions:read
+      - users:read
+
+      # --- DMs ---------------------------------------------------------------
+      - im:history
+      - im:read
+      - im:write
+
+      # --- Public channels the bot is a member of -----------------------------
+      - channels:history
+      # - channels:read     # OPTIONAL: see public channel metadata even when
+                             # NOT a member (broader than the default; only
+                             # add if the bot needs to discover channels it
+                             # hasn't been invited to yet)
+      # - channels:join     # OPTIONAL: let the bot invite itself to channels
+                             # instead of requiring a human `/invite`. Softens
+                             # the "channel membership = containment boundary"
+                             # model -- add deliberately, not by default.
+
+      # --- Private channels ------------------------------------------------
+      - groups:history
+      # - groups:read       # OPTIONAL: see private-channel metadata
+      # - groups:write      # OPTIONAL: create/archive/rename private channels
+                             # -- real functional surface, not just read access
+
+      # --- Group DMs ---------------------------------------------------------
+      - mpim:history
+      # - mpim:read
+      # - mpim:write        # OPTIONAL: create/manage group DMs
+
+      # --- Files -------------------------------------------------------------
+      # - files:write       # OPTIONAL: bot sends/uploads files
+      # - files:read        # OPTIONAL: bot reads/downloads files users share
+                             # (add both if the flow is two-way, e.g. users
+                             # upload a CSV for the bot to process)
+
+      # --- Reactions / pins / emoji (engagement-tracking use cases) --------
+      # - reactions:read
+      # - reactions:write   # OPTIONAL: bot reads/adds emoji reactions
+      # - pins:read
+      # - pins:write        # OPTIONAL: bot reads/manages pinned messages
+      # - emoji:read        # OPTIONAL: bot resolves custom workspace emoji
+
+      # --- AI Assistant surface (pair with features.assistant_view above) -
+      # - assistant:write
+
+  pkce_enabled: false
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im
+      - message.channels
+      # - message.groups        # OPTIONAL: pair with groups:history
+      # - message.mpim          # OPTIONAL: pair with mpim:history
+      # - reaction_added        # OPTIONAL: pair with reactions:read/write
+      # - reaction_removed
+      # - member_joined_channel # OPTIONAL: track channel membership changes
+      # - member_left_channel
+      # - channel_rename
+      # - pin_added             # OPTIONAL: pair with pins:read/write
+      # - pin_removed
+
+  # Only needed if the bot uses interactive components (buttons, modals,
+  # shortcuts) -- e.g. as part of the Assistant surface's suggested prompts,
+  # or custom block-kit UI. Requires handling block_actions/view_submission
+  # payloads in code. Leave false for a plain messaging bot.
+  interactivity:
+    is_enabled: false
+
+  org_deploy_enabled: false
+
+  # Load-bearing for this template's deployment model: the gateway connects
+  # OUTBOUND to Slack, so no inbound port/public endpoint is ever needed.
+  # Do not disable unless you're deliberately moving off the
+  # no-inbound-access VPS topology documented in DEPLOYMENT.md.
+  socket_mode_enabled: true
+
+  token_rotation_enabled: false
+  is_mcp_enabled: false
