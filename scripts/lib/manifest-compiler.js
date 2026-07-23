@@ -21,8 +21,12 @@ const JSON5 = require("json5");
 const ID_RE = /^[a-z0-9][a-z0-9_-]*$/;
 
 // Fields recognized in an agent package's own openclaw.agent.json5 (§3.1).
+// `notes` is a free-form documentation field: authors may leave prose about the
+// package here. The compiler accepts it and otherwise ignores it (never copied
+// into openclaw.json).
 const PACKAGE_FIELDS = new Set([
-  "id", "name", "role", "tools", "model", "skills", "identity", "notes", "env", "system",
+  "id", "name", "role", "tools", "model", "skills", "identity", "env", "system",
+  "notes",
 ]);
 // Deploy-only fields, valid ONLY in agents.manifest.json5 entries (§4).
 // `allowInstallScripts` is deploy-only on purpose: whether to run a third-party
@@ -285,6 +289,9 @@ function parseManifest(manifestText) {
     if (entry.allowSystemDeps !== undefined && typeof entry.allowSystemDeps !== "boolean") {
       errors.push(`${label}: 'allowSystemDeps' must be a boolean`);
     }
+    if (entry.timeoutMs !== undefined && !(typeof entry.timeoutMs === "number" && Number.isFinite(entry.timeoutMs) && entry.timeoutMs > 0)) {
+      errors.push(`${label}: 'timeoutMs' must be a positive finite number`);
+    }
 
     agents.push({
       index,
@@ -303,7 +310,6 @@ function parseManifest(manifestText) {
         model: entry.model,
         skills: entry.skills,
         identity: entry.identity,
-        notes: entry.notes,
         // Presence-tracked separately from the normalized value: an explicit
         // `env: {}` in the manifest should still override (blank out) a
         // package's env request, so we key "was it given?" off entry.env.

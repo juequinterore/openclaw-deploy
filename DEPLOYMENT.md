@@ -19,7 +19,7 @@ specialists" — that's a config feature of a *single* deployment (try
 ## Repo structure
 
 ```
-docker-compose.yml          # vendored from upstream, pinned to tag v2026.6.11
+docker-compose.yml          # vendored from upstream, pinned via OPENCLAW_VERSION in .env
 docker-compose.extra.yml    # our overrides: home volume, data-dir mounts, no ports
 docker-compose.dashboard.yml # opt-in: re-publish the gateway port to host loopback for the Control UI
 Dockerfile                  # optional: Python-enabled base image (see "Python & OS-level agent dependencies")
@@ -51,11 +51,11 @@ entirely if every agent you run is npm-only (or has none).
 ## Summary of this setup
 
 - Runs via **Docker Compose**, using the official pre-built image, pinned to
-  a specific version (`ghcr.io/openclaw/openclaw:2026.6.11`) rather than
-  `:latest` — see "Updating the image version" below.
+  a specific version via `OPENCLAW_VERSION` in `.env` (currently `2026.7.1`)
+  rather than `:latest` — see "Updating the image version" below.
 - Agent execution runs through the **Claude Code CLI** (`claude-cli` runtime),
   authenticated via OAuth login, not a raw Anthropic API key.
-- Default model: **`anthropic/claude-sonnet-4-6`**.
+- Default model: **`anthropic/claude-sonnet-5`**.
 - Gateway is **loopback-only** — no inbound network exposure. Intended
   interaction modes are (1) Slack (outbound Socket Mode connection) and
   (2) local terminal access via `docker compose run openclaw-cli chat`.
@@ -148,7 +148,7 @@ docker compose run --rm --no-deps --entrypoint node openclaw-gateway \
   dist/index.js onboard --mode local --no-install-daemon \
   --non-interactive --accept-risk --auth-choice anthropic-cli \
   --gateway-bind loopback --skip-channels --skip-skills --skip-hooks --skip-search --skip-health
-docker compose run --rm openclaw-cli config set agents.defaults.model.primary anthropic/claude-sonnet-4-6
+docker compose run --rm openclaw-cli config set agents.defaults.model.primary anthropic/claude-sonnet-5
 ```
 
 Pin the **full** `claude-cli` backend `args`/`resumeArgs`. Setting only
@@ -193,7 +193,7 @@ docker compose up -d openclaw-gateway
 docker compose ps
 docker compose logs openclaw-gateway --tail 20
 ```
-Look for `agent model: anthropic/claude-sonnet-4-6` and `ready` in the logs,
+Look for `agent model: anthropic/claude-sonnet-5` and `ready` in the logs,
 and `healthy` in `docker compose ps`.
 
 **Restart (clean stop/recreate):**
@@ -246,7 +246,8 @@ docker compose run --rm --entrypoint sh openclaw-cli -lc '<command>'
 ### `.env`
 
 ```bash
-OPENCLAW_IMAGE=ghcr.io/openclaw/openclaw:2026.6.11   # pinned version, not :latest
+OPENCLAW_VERSION=2026.7.1                            # single source of truth for the version
+OPENCLAW_IMAGE=ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION}   # pinned version, not :latest
 OPENCLAW_CONFIG_DIR=./.openclaw-data/config
 OPENCLAW_WORKSPACE_DIR=./.openclaw-data/workspace
 OPENCLAW_AUTH_PROFILE_SECRET_DIR=./.openclaw-data/auth-secrets
@@ -254,11 +255,16 @@ OPENCLAW_GATEWAY_BIND=loopback                       # no inbound network exposu
 OPENCLAW_GATEWAY_TOKEN=<generate with: openssl rand -hex 32>
 COMPOSE_FILE=docker-compose.yml:docker-compose.extra.yml
 ```
-These are the lines `setup.sh` auto-fills. Two more, in the "Multi-agent /
-advanced" block, stay commented and are only for running several agents on one
-host (see that section): `COMPOSE_PROJECT_NAME` (defaults to the deploy
-directory name; namespaces containers and the `<project>_home` volume) and
-`OPENCLAW_HOME_VOLUME` (override the home volume's exact name).
+These are the lines `setup.sh` auto-fills. A few more, in the "Multi-agent /
+advanced" block, stay commented and are only needed for optional cases (see
+that section in `.env.example`): `COMPOSE_PROJECT_NAME` (defaults to the
+deploy directory name; namespaces containers and the `<project>_home`
+volume) and `OPENCLAW_HOME_VOLUME` (override the home volume's exact name)
+for running several agents on one host; `OPENCLAW_BRIDGE_PORT` /
+`OPENCLAW_MSTEAMS_PORT` (extra published ports, loopback-only by default) and
+`OPENCLAW_TZ` (container timezone) for channels/logging that need them; and
+the `OTEL_*` / `CLAUDE_WEB_*` block for OpenTelemetry export or web-session
+auth, neither of which this deployment uses by default.
 
 Provider API keys (`ANTHROPIC_API_KEY` etc., near the top of `.env.example`)
 are left commented out on purpose — auth flows through the Claude CLI's own
@@ -297,8 +303,8 @@ approvals).
 ### `openclaw.json` (inside `.openclaw-data/config/`, not hand-edited directly)
 
 Key settings, set via `openclaw config set` / `onboard`:
-- `agents.defaults.model.primary`: `"anthropic/claude-sonnet-4-6"`
-- `agents.defaults.models["anthropic/claude-sonnet-4-6"].agentRuntime.id`:
+- `agents.defaults.model.primary`: `"anthropic/claude-sonnet-5"`
+- `agents.defaults.models["anthropic/claude-sonnet-5"].agentRuntime.id`:
   `"claude-cli"` — this is what routes execution through the CLI instead of
   a direct API call.
 - `agents.defaults.cliBackends.claude-cli.command`:
@@ -363,10 +369,13 @@ regenerated or re-supplied on each machine:
 
 ## Updating the image version
 
-`OPENCLAW_IMAGE` is pinned to a specific version tag rather than `:latest`,
-so upstream releases can't silently change behavior underneath this
-deployment. Because `docker-compose.yml` here is a vendored copy (not a live
-upstream checkout), bumping the image version is a two-part deliberate step:
+`OPENCLAW_VERSION` in `.env` is the single source of truth for the version —
+it drives the pulled `OPENCLAW_IMAGE` tag, the locally-built Dockerfile's
+`FROM` base, and the built image tag, all at once. It's pinned to a specific
+version rather than `:latest`, so upstream releases can't silently change
+behavior underneath this deployment. Because `docker-compose.yml` here is a
+vendored copy (not a live upstream checkout), bumping the version is a
+deliberate step:
 
 ```bash
 # 1. check current version
@@ -379,8 +388,9 @@ curl -o /tmp/docker-compose.yml.new \
   https://raw.githubusercontent.com/openclaw/openclaw/v<NEW_VERSION>/docker-compose.yml
 diff docker-compose.yml /tmp/docker-compose.yml.new
 
-# 3. bump OPENCLAW_IMAGE in .env to the new tag, then:
-docker compose pull openclaw-gateway
+# 3. bump OPENCLAW_VERSION in .env to the new version, then:
+docker compose pull openclaw-gateway   # stock image
+docker compose build                   # or, if using the local Python-enabled Dockerfile
 docker compose up -d openclaw-gateway
 
 # 4. verify
@@ -390,10 +400,10 @@ docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
 ```
 
 Available image tags: `main`, `latest`, dated/numbered releases (e.g.
-`2026.6.11`), and beta tags, published to both `ghcr.io/openclaw/openclaw`
+`2026.7.1`), and beta tags, published to both `ghcr.io/openclaw/openclaw`
 and `openclaw/openclaw` (Docker Hub). If you roll back, just set
-`OPENCLAW_IMAGE` back to the previous tag and repeat steps 3–4 (and re-fetch
-the matching `docker-compose.yml` if it had changed).
+`OPENCLAW_VERSION` back to the previous version and repeat steps 3–4 (and
+re-fetch the matching `docker-compose.yml` if it had changed).
 
 ## Deploying to a VPS (Slack + local terminal only)
 
@@ -623,9 +633,13 @@ The default manifest has one entry — the reference/demo package at
 ```
 
 `--sync-agents` is idempotent (re-running with an unchanged manifest is a
-no-op patch) but **not silent**: it always restarts the gateway to apply the
-new tool policy, which **interrupts any live sessions** — run it during a
-quiet window on a box serving real Slack traffic.
+no-op patch) but **not silent**: it restarts the gateway to apply the new
+tool policy, which **interrupts any live sessions** — run it during a quiet
+window on a box serving real Slack traffic. The restart is skipped (not
+forced) if a specialist process has been running for more than 90 seconds,
+since a restart would silently kill it mid-run with no completion event ever
+firing; the sync aborts in that case rather than interrupting it. Override
+with `OPENCLAW_SYNC_FORCE_RESTART=1` to restart anyway.
 
 Confirm the full lifecycle on a real messaging channel with a **fresh
 conversation** (`/new` on Discord, then send an echo request). Existing
@@ -703,6 +717,9 @@ The sync-owned enabling keys, verified against `openclaw config schema`:
   in the manifest to raise it.
 - **`agents.defaults.skipBootstrap: true`** — pre-seeded agents ship their
   persona already, so the interactive first-run bootstrap ritual is skipped.
+- **`agents.defaults.cliBackends.claude-cli.reliability.watchdog.resume.noOutputTimeoutMs`**
+  — pinned to `180000` (180s) on every sync, raised from the runtime default
+  to tolerate slower specialist turns without the watchdog killing a resume.
 
 Routing is **prompt-driven**: the coordinator's `AGENTS.md` is **generated**
 from the manifest (routing table row per agent, from its `role`/`routeHint`) —
@@ -762,6 +779,9 @@ Two ways to validate:
     --agent main --message "Please have the echo specialist repeat back: banana" \
     --json --timeout 120
   ```
+  120s matches the gateway healthcheck's `start_period: 20s` plus margin for a
+  cold specialist dispatch; README.md's quick-start example uses the same
+  value.
 
 - **Dashboard (Control UI)** — to drive it by hand. The template binds the
   gateway to loopback with no published port, so the dashboard is unreachable by
@@ -841,16 +861,17 @@ dependency-free) agent like `echo-bot`.
    ```bash
    # In .env, point OPENCLAW_IMAGE at a LOCAL tag — NOT the literal
    # "openclaw:local" sentinel setup.sh's preflight rejects as "unset":
-   OPENCLAW_IMAGE=openclaw-deploy-py:2026.6.11
+   OPENCLAW_IMAGE=openclaw-deploy-py:${OPENCLAW_VERSION}
 
    docker compose build
    docker compose up -d openclaw-gateway
    ```
    This builds the committed `Dockerfile` (pip + `python-is-python3` + the
    per-agent `pyhook/sitecustomize.py` import hook — see `AGENTS-DEPS-SPEC.md`
-   §3.4/§5), FROM the same pinned upstream tag this repo already tracks. Keep
-   the `Dockerfile`'s `FROM` tag and this `OPENCLAW_IMAGE` value in sync when
-   you bump versions (same ritual as "Updating the image version" above).
+   §3.4/§5), FROM the same pinned upstream version this repo already tracks —
+   both derive from the single `OPENCLAW_VERSION` in `.env`, so there's
+   nothing to keep in sync by hand when you bump versions (see "Updating the
+   image version" above).
 2. **Ship a fully `==`-pinned lock if you want reproducible installs** —
    `requirements.lock`, or a `requirements.txt` that's itself the output of
    `pip freeze` / `pip-compile` / `uv pip compile`. This is recommended but no

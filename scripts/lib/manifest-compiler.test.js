@@ -337,6 +337,180 @@ test("regression: basic manifest with no system/env still assembles cleanly", ()
   assert.deepStrictEqual(asm.data.summary.added, ["widget"]);
 });
 
+// --- looksLikeBranch: warning, not error ------------------------------------
+
+test("looksLikeBranch warns on a branch-shaped ref but not on a tag or SHA", () => {
+  const manifestObj = (ref) => ({
+    agents: [{ source: "git@github.com:acme/repo.git", ref, id: "widget" }],
+  });
+
+  const branchRes = lintStatic({ manifestText: JSON.stringify(manifestObj("chore/foo")) });
+  assert.strictEqual(branchRes.ok, true, JSON.stringify(branchRes));
+  assert.ok(branchRes.warnings.some((w) => w.includes("looks like a branch")), branchRes.warnings.join("\n"));
+
+  const tagRes = lintStatic({ manifestText: JSON.stringify(manifestObj("v1.2.0")) });
+  assert.strictEqual(tagRes.ok, true, JSON.stringify(tagRes));
+  assert.ok(!tagRes.warnings.some((w) => w.includes("looks like a branch")), tagRes.warnings.join("\n"));
+
+  const shaRes = lintStatic({ manifestText: JSON.stringify(manifestObj("a1b2c3d")) });
+  assert.strictEqual(shaRes.ok, true, JSON.stringify(shaRes));
+  assert.ok(!shaRes.warnings.some((w) => w.includes("looks like a branch")), shaRes.warnings.join("\n"));
+});
+
+// --- duplicate id rejection: explicit (static) vs effective (post-fetch) ---
+
+test("duplicate explicit id in the manifest is a static-lint error", () => {
+  const manifestText = JSON.stringify({
+    agents: [
+      { source: "../pkg-a", ref: null, id: "dup" },
+      { source: "../pkg-b", ref: null, id: "dup" },
+    ],
+  });
+  const res = lintStatic({ manifestText });
+  assert.strictEqual(res.ok, false);
+  assert.ok(res.errors.some((e) => /duplicate explicit id 'dup'/.test(e)), res.errors.join("\n"));
+});
+
+test("duplicate effective id (from package openclaw.agent.json5, no manifest override) is a post-fetch error", () => {
+  const manifestText = JSON.stringify({
+    agents: [
+      { source: "../pkg-a", ref: null },
+      { source: "../pkg-b", ref: null },
+    ],
+  });
+  const packages = [
+    pkgDoc({ slug: "pkg-a", agentJson5Text: JSON.stringify({ id: "dup" }) }),
+    pkgDoc({ slug: "pkg-b", agentJson5Text: JSON.stringify({ id: "dup" }) }),
+  ];
+  const res = lintPostfetch({ manifestText, packages });
+  assert.strictEqual(res.ok, false);
+  assert.ok(res.errors.some((e) => /duplicate effective id/.test(e)), res.errors.join("\n"));
+});
+
+// --- slug dedupe: two local sources slugifying to the same base ------------
+
+test("slug dedupe appends -2 to the second colliding slug", () => {
+  const manifestText = JSON.stringify({
+    agents: [
+      { source: "../pkg", ref: null, id: "one" },
+      { source: "./pkg", ref: null, id: "two" },
+    ],
+  });
+  const res = lintStatic({ manifestText });
+  assert.strictEqual(res.ok, true, JSON.stringify(res));
+  const slugs = res.data.agents.map((a) => a.slug);
+  assert.deepStrictEqual(slugs, ["pkg", "pkg-2"]);
+});
+
+// --- foreign-agent detection -------------------------------------------------
+
+test("foreignIds: hand-added entry at a non-sync-owned workspace is foreign", () => {
+  const asm = assemble({
+    coordinator: { ...COORDINATOR_DEFAULTS },
+    effectiveAgents: [],
+    currentAgentsList: [
+      { id: "handmade", workspace: "/home/node/.openclaw/workspace/handmade" },
+    ],
+  });
+  assert.strictEqual(asm.ok, true, JSON.stringify(asm));
+  assert.deepStrictEqual(asm.data.foreignIds, ["handmade"]);
+});
+
+test("foreignIds: entry at the sync-owned path for an id no longer in the manifest is dropped idempotently, not foreign", () => {
+  const asm = assemble({
+    coordinator: { ...COORDINATOR_DEFAULTS },
+    effectiveAgents: [],
+    currentAgentsList: [
+      { id: "retired", workspace: "/home/node/.openclaw/agents/retired/workspace" },
+    ],
+  });
+  assert.strictEqual(asm.ok, true, JSON.stringify(asm));
+  // Not foreign (no abort-worthy hand-added entry) even though it IS reported
+  // as removed from the specialist list — foreignIds gates the abort/--prune
+  // path, summary.removed is just "no longer in the new agents.list".
+  assert.deepStrictEqual(asm.data.foreignIds, []);
+  assert.deepStrictEqual(asm.data.summary.removed, ["retired"]);
+});
+
+test("foreignIds: the coordinator's own id is never foreign", () => {
+  const asm = assemble({
+    coordinator: { ...COORDINATOR_DEFAULTS },
+    effectiveAgents: [],
+    currentAgentsList: [
+      { id: COORDINATOR_DEFAULTS.id, workspace: "/anything" },
+    ],
+  });
+  assert.strictEqual(asm.ok, true, JSON.stringify(asm));
+  assert.deepStrictEqual(asm.data.foreignIds, []);
+});
+
+// --- env:{} blanks a package's env request (twin of the system:{} test) ---
+
+test("empty manifest env:{} blanks out the package's env request", () => {
+  const manifestText = JSON.stringify(baseManifestObj({ env: {} }));
+  const packages = [
+    pkgDoc({ agentJson5Text: JSON.stringify({ id: "widget", env: { required: ["FOO"] } }) }),
+  ];
+  const res = lintPostfetch({ manifestText, packages });
+  assert.strictEqual(res.ok, true, JSON.stringify(res));
+  assert.deepStrictEqual(res.data.effectiveAgents[0].env, { required: [], optional: [] });
+});
+
+test("package env passes through when manifest gives no override", () => {
+  const manifestText = JSON.stringify(baseManifestObj({}));
+  const packages = [
+    pkgDoc({ agentJson5Text: JSON.stringify({ id: "widget", env: { required: ["FOO"] } }) }),
+  ];
+  const res = lintPostfetch({ manifestText, packages });
+  assert.strictEqual(res.ok, true, JSON.stringify(res));
+  assert.deepStrictEqual(res.data.effectiveAgents[0].env.required, ["FOO"]);
+});
+
+// --- disableSkills / skillDirsToSkip filtering ------------------------------
+
+test("disableSkills removes matching entries from an explicit skills allowlist", () => {
+  const manifestText = JSON.stringify(baseManifestObj({ disableSkills: ["foo"] }));
+  const packages = [
+    pkgDoc({
+      agentJson5Text: JSON.stringify({ id: "widget", skills: ["foo", "bar"] }),
+      skillDirs: [{ dirBasename: "foo", frontmatterName: "foo" }, { dirBasename: "bar", frontmatterName: "bar" }],
+    }),
+  ];
+  const res = lintPostfetch({ manifestText, packages });
+  assert.strictEqual(res.ok, true, JSON.stringify(res));
+  assert.deepStrictEqual(res.data.effectiveAgents[0].skills, ["bar"]);
+  assert.deepStrictEqual(res.data.effectiveAgents[0].skillDirsToSkip, ["foo"]);
+});
+
+test("an omitted skills allowlist stays omitted even with disableSkills set", () => {
+  const manifestText = JSON.stringify(baseManifestObj({ disableSkills: ["foo"] }));
+  const packages = [
+    pkgDoc({
+      agentJson5Text: JSON.stringify({ id: "widget" }),
+      skillDirs: [{ dirBasename: "foo", frontmatterName: "foo" }],
+    }),
+  ];
+  const res = lintPostfetch({ manifestText, packages });
+  assert.strictEqual(res.ok, true, JSON.stringify(res));
+  assert.strictEqual(res.data.effectiveAgents[0].skills, undefined);
+  assert.deepStrictEqual(res.data.effectiveAgents[0].skillDirsToSkip, ["foo"]);
+});
+
+// --- timeoutMs: must be a positive finite number ----------------------------
+
+test("timeoutMs rejects a string (previously silently coerced)", () => {
+  const manifestText = JSON.stringify(baseManifestObj({ timeoutMs: "600000" }));
+  const res = lintStatic({ manifestText });
+  assert.strictEqual(res.ok, false);
+  assert.ok(res.errors.some((e) => e.includes("timeoutMs")), res.errors.join("\n"));
+});
+
+test("timeoutMs accepts a positive number", () => {
+  const manifestText = JSON.stringify(baseManifestObj({ timeoutMs: 600000 }));
+  const res = lintStatic({ manifestText });
+  assert.strictEqual(res.ok, true, JSON.stringify(res));
+});
+
 console.log(`manifest-compiler.test.js: ${passed} passed`);
 if (process.exitCode) {
   console.error("manifest-compiler.test.js: FAILURES ABOVE");

@@ -164,7 +164,7 @@ agent's tool `cwd`). Every field is optional except a stable `id`. It is a
   name:  "💳 Billing",                     // display name / identity.name
   role:  "Invoices, refunds, payment disputes.",  // one line → coordinator routing
   tools: { profile: "coding" },           // messaging | coding | full (deploy caps this)
-  model: "anthropic/claude-sonnet-4-6",   // optional; else inherits deploy default
+  model: "anthropic/claude-sonnet-5",     // optional; else inherits deploy default
   skills: ["invoice-lookup"],             // per-agent skill allowlist (REPLACES defaults — verified, §2)
   identity: { emoji: "💳" },
   env: {                                  // env var NAMES this agent needs (§7.2); values live in the deploy .env
@@ -177,8 +177,6 @@ agent's tool `cwd`). Every field is optional except a stable `id`. It is a
     // detected `playwright` Python dependency (§7.4); give it explicitly
     // only to request a different browser set.
   },
-  // Free-form note surfaced to reviewers; not consumed by the runtime:
-  notes: "Degrades gracefully without TAVILY_API_KEY (skips web enrichment).",
 }
 ```
 
@@ -395,6 +393,7 @@ sync, with values derived only from the manifest**:
 | `session.agentToAgent.maxPingPongTurns` | from `coordinator` |
 | `agents.defaults.skipBootstrap` | `true` |
 | `agents.defaults.subagents.runTimeoutSeconds` | largest enabled specialist `timeoutMs`, rounded up |
+| `agents.defaults.cliBackends.claude-cli.reliability.watchdog.resume.noOutputTimeoutMs` | `180000` |
 
 Because nothing is written conditionally and no key outside this set is ever
 touched (in particular, **never** the global `skills.entries.*` — see §7), a

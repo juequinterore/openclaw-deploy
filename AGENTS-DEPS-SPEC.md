@@ -12,6 +12,9 @@
 > test #7) — and the built `Dockerfile` itself was re-verified end to end the
 > same day (build, pip/tomllib presence, `--target` install, and the
 > cwd-keyed `sitecustomize` hook isolating two conflicting-version installs).
+> The deployment has since moved to `2026.7.1` (see `OPENCLAW_VERSION` in
+> `.env`); nothing here is version-specific, but these facts were not
+> re-verified against the newer base.
 > The five design decisions (D1–D5) are settled and recorded in §9 — **D2 was
 > revised 2026-07-16**: a pinned lock is now *preferred, not required* (Python
 > agents in the wild routinely ship only ranges — §3.2). §12 lists items to
@@ -273,7 +276,8 @@ thin, committed base image — the Python equivalent of the npm already present,
 
 ```dockerfile
 # Dockerfile (committed; built once → OPENCLAW_IMAGE)
-FROM ghcr.io/openclaw/openclaw:2026.6.11
+ARG OPENCLAW_VERSION=2026.7.1
+FROM ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION}
 USER root
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3-pip python-is-python3 \
@@ -458,11 +462,14 @@ blast radius small.)*
       lock-resolution live entirely in bash+`python3`/`tomllib`, mirroring how
       the existing npm path is bash-only with no compiler involvement.)
 - [x] Committed base `Dockerfile` (§5): pip + `python-is-python3` + the
-      `pyhook/sitecustomize.py` (walk-up) + `ENV PYTHONPATH=/opt/pyhook`.
-      DEPLOYMENT.md note to build it and set `OPENCLAW_IMAGE`. Verified: built
-      the image, confirmed `pip`/`python`/`tomllib` present, a `--target`
-      install with no PEP-668 error, and the hook isolating two conflicting
-      per-agent installs from each other via `cwd`.
+      `pyhook/sitecustomize.py` (walk-up), installed by overwriting the
+      interpreter's own stdlib `sitecustomize.py` — **not** `PYTHONPATH`, which
+      was tried and rejected (§3.4's revision note: OpenClaw's exec tool
+      doesn't inherit it). DEPLOYMENT.md note to build it and set
+      `OPENCLAW_IMAGE`. Verified: built the image, confirmed `pip`/`python`/
+      `tomllib` present, a `--target` install with no PEP-668 error, and the
+      hook isolating two conflicting per-agent installs from each other via
+      `cwd`.
 - [x] OS-dep preflight validator (`dpkg -s`, browser presence check) that
       aborts with the generated Dockerfile snippet + rebuild command
       (validate-and-instruct — D1; no auto-build in v1). Playwright version is

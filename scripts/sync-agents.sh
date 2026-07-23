@@ -452,6 +452,7 @@ CONFIG_DIR=$(docker compose config --format json 2>/dev/null \
 WORKSPACE_DIR=$(docker compose config --format json 2>/dev/null \
   | jq -r '.services["openclaw-gateway"].volumes[] | select(.target=="/home/node/.openclaw/workspace") | .source')
 [[ -n "$CONFIG_DIR" ]] || fail "Could not resolve the gateway's config volume via 'docker compose config'."
+[[ -n "$WORKSPACE_DIR" ]] || fail "Could not resolve the gateway's workspace volume via 'docker compose config'."
 CONFIG_JSON="$CONFIG_DIR/openclaw.json"
 [[ -f "$CONFIG_JSON" ]] || fail "$CONFIG_JSON not found — run ./setup.sh first (base setup must be done)."
 jq -e '(.agents.defaults.cliBackends["claude-cli"].args // []) | length > 0' "$CONFIG_JSON" >/dev/null 2>&1 \
@@ -779,7 +780,12 @@ jq -r '
 PATCH_JSON=$(jq -c '.data.patch' <<<"$RESULT3")
 
 log "Snapshotting openclaw.json (rollback point)"
-cp "$CONFIG_JSON" "$CONFIG_JSON.presync"
+# Refuse to clobber a leftover .presync from a previous run that failed before
+# reaching step 9's cleanup: that file is the ONLY remaining copy of the true
+# pre-sync state, and overwriting it with the current (possibly already-
+# patched) config would make that state unrecoverable.
+[[ -f "$CONFIG_JSON.presync" ]] && fail "$CONFIG_JSON.presync already exists — a previous sync did not complete cleanly. Inspect it (it may be the last known-good config) and either restore it manually (cp \"$CONFIG_JSON.presync\" \"$CONFIG_JSON\" && docker compose restart openclaw-gateway) or remove it once you've confirmed the current config is fine, then re-run."
+cp -p "$CONFIG_JSON" "$CONFIG_JSON.presync"
 
 rollback() {
   local reason="$1"
@@ -788,6 +794,12 @@ rollback() {
   docker compose restart openclaw-gateway || true
   fail "$reason"
 }
+# From here through the end of step 6 (persona write + chown), any failure
+# under `set -e` must roll back rather than leave the config patched with the
+# gateway still serving the old one. trap ERR covers command failures this
+# section doesn't already guard with `|| rollback` (e.g. the jq extractions,
+# the AGENTS.md heredoc write, the chown/sudo block).
+trap 'rollback "unexpected failure while regenerating the coordinator persona (post-patch section)"' ERR
 
 log "Validating config patch (dry-run)"
 printf '%s' "$PATCH_JSON" | docker compose run -T --rm openclaw-cli \
@@ -883,8 +895,8 @@ produces one deliverable set per run.
    ONE exception: a thinking-level directive in the request ("use medium
    thinking", "think harder", "no thinking") is routing metadata — apply it
    as the spawn's `thinking` parameter (valid levels: off, minimal, low,
-   medium, high; map phrasing to the nearest level) and leave it out of the
-   forwarded task text. Without such a directive, use the table's
+   medium, high, adaptive; map phrasing to the nearest level) and leave it out
+   of the forwarded task text. Without such a directive, use the table's
    thinking="…" value; if the table has none, omit the parameter.
 2. If the spawn is accepted, your FINAL message for this turn is ONE short
    sentence (naming every job, if you split a request into several): which
@@ -1002,6 +1014,7 @@ if [[ "$(uname -s)" == "Linux" ]]; then
     else sudo chown -R 1000:1000 "$WORKSPACE_DIR"; fi
   fi
 fi
+trap - ERR   # post-patch section (persona write + chown) completed cleanly
 
 # --- 7. restart -----------------------------------------------------------
 # A gateway restart silently kills any in-flight specialist run: the child

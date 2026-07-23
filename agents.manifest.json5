@@ -31,9 +31,11 @@
     // lead-intake specialist whose skills are TypeScript (installed in-image
     // via npm ci — AGENTS-PLUGINS.md §7.1) and which needs HubSpot/Tavily
     // secrets from THIS deployment's .env (declared by name — §7.2). Uncomment
-    // and pin a real ref to plug her in:
+    // and pin a real ref (a tag or SHA, not a mutable branch) to plug her in:
     //
-    { source: "git@bitbucket.org:57blocks/sallie.git", ref: "chore/testing-standards-and-tests",
+    {
+      source: "git@bitbucket.org:57blocks/sallie.git",
+      ref: "23ec3cd29750706ebde9bc0d1dcc3019abd60060",   // main @ 2026-07-23
       id: "sallie", name: "Sallie", role: "Event lead intake, scoring, HubSpot pushes.",
       model: "anthropic/claude-sonnet-5",   // this deploy runs claude-cli, not her native gpt-5.4
       tools: { profile: "coding" },
@@ -43,7 +45,7 @@
       // missing the window, flip back to the default "spawn".
       dispatch: "send",
       timeoutMs: 600000,                       // "typically done within" budget quoted to users (send replies are near-instant; this bounds worst-case)
-
+    
       env: {
         // Only secret the branch's skill code actually reads at runtime
         // (process.env["HUBSPOT_ACCESS_TOKEN"], shared/single-tenant — the
@@ -51,7 +53,8 @@
         required: ["HUBSPOT_ACCESS_TOKEN"],
         // Voice intake; only matters if this deployment wires Whisper.
         optional: ["OPENAI_WHISPER_API_KEY"],
-      } },
+      } 
+    },
 
     // Virginia — the worked Python example (AGENTS-DEPS-SPEC.md). Her repo was
     // restructured for the pluggable-agent contract on the branch below
@@ -61,9 +64,11 @@
     // (Python, into .python-site) and package.json declares openbrand (npm);
     // `playwright` auto-derives a chromium browser layer (§7.4), so the first
     // sync will abort with the exact Dockerfile lines to append (chromium is a
-    // root/apt image layer, never installed into a workspace).
+    // root/apt image layer, never installed into a workspace). Uncomment and
+    // pin a real ref (a tag or SHA, not a mutable branch) to plug her in:
+    //
     { source: "git@bitbucket.org:57blocks/onepagerbuilder.git",
-      ref: "feature/email_sub_agent",
+      ref: "459c7f6839e63d1d72e1557e39ec30f30951e985",  // feature/email_sub_agent @ 459c7f6
       timeoutMs: 1500000,  // 25-minute safety ceiling; typical full research + rendering runs take 6-15 minutes
       // The gateway's default thinking=adaptive let sonnet burn two ~30K-token
       // extended-thinking blocks (~17 min of wall-clock) authoring one brief

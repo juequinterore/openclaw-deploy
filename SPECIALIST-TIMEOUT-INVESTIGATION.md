@@ -124,9 +124,17 @@ long.
 
 ## What this means / what's not yet done
 
+> **SUPERSEDED.** The dispatch-then-poll design below was the plan at the time
+> this section was written, but it was never built — the final fix (see the
+> **Status: FIXED** note at the top of this document) took a different path
+> instead: requester-aware `sessions_spawn` with automatic completion
+> delivery, no polling required. This section is kept as a historical record
+> of the intermediate design; do not implement it.
+
 This is a **verified workaround pattern**, hand-driven via direct CLI prompts
-in this investigation — it is **not yet the actual behavior** of this
-deployment's coordinator. To make it real:
+in this investigation — it was, at the time, **not yet the actual behavior**
+of this deployment's coordinator, and it never became that behavior (see the
+callout above). What it described:
 
 - `main`'s generated persona (built by `scripts/lib/manifest-compiler.js`,
   written to `AGENTS.md` on every `--sync-agents` run) needs its routing

@@ -4,20 +4,24 @@
 # so plugged-in agents can auto-extract Python deps symmetrically with the
 # existing npm path (AGENTS-PLUGINS.md §7.1/§7.3).
 #
-# `docker-compose.yml` already has `build: .` and `image: ${OPENCLAW_IMAGE:-…}`
-# (vendored from upstream, generic — see that file's own header comment), so
-# building this slots in with NO compose changes:
+# `docker-compose.yml` already has `build: .` (with `args: OPENCLAW_VERSION`)
+# and `image: ${OPENCLAW_IMAGE:-…}` (vendored from upstream, generic — see that
+# file's own header comment), so building this slots in with NO compose
+# changes:
 #
-#   1. Set OPENCLAW_IMAGE in .env to a LOCAL tag, distinct from the
-#      "openclaw:local" sentinel setup.sh's preflight rejects, e.g.:
-#        OPENCLAW_IMAGE=openclaw-deploy-py:2026.6.11
+#   1. Set OPENCLAW_VERSION and OPENCLAW_IMAGE in .env (a LOCAL tag, distinct
+#      from the "openclaw:local" sentinel setup.sh's preflight rejects), e.g.:
+#        OPENCLAW_VERSION=2026.7.1
+#        OPENCLAW_IMAGE=openclaw-deploy-py:${OPENCLAW_VERSION}
 #   2. docker compose build
 #   3. docker compose up -d openclaw-gateway
 #
-# The FROM tag below must track this deployment's own `OPENCLAW_IMAGE` pin in
-# .env.example — bump both together (see docker-compose.yml's "Updating the
-# image version" ritual in DEPLOYMENT.md).
-FROM ghcr.io/openclaw/openclaw:2026.7.1
+# The version comes from OPENCLAW_VERSION and the tag from OPENCLAW_IMAGE,
+# both in .env — one value drives the pulled tag, this Dockerfile's FROM base,
+# and the locally-built image tag, so there is nothing left to keep in sync by
+# hand.
+ARG OPENCLAW_VERSION=2026.7.1
+FROM ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION}
 
 USER root
 RUN apt-get update \

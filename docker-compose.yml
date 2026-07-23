@@ -1,9 +1,10 @@
-# Vendored from https://github.com/openclaw/openclaw at tag v2026.6.11
-# (matches OPENCLAW_IMAGE in .env). This repo intentionally does not clone
-# the full upstream source tree — we only run the pre-built image, never
-# build from source, so this one file is all that's needed from upstream.
+# Vendored from https://github.com/openclaw/openclaw. Pinned via
+# OPENCLAW_VERSION in .env (currently 2026.7.1). This repo intentionally does
+# not clone the full upstream source tree — we only run the pre-built image,
+# never build from source, so this one file is all that's needed from
+# upstream.
 #
-# On upgrade: bump OPENCLAW_IMAGE in .env, then re-fetch this file at the
+# On upgrade: bump OPENCLAW_VERSION in .env, then re-fetch this file at the
 # matching git tag (note the "v" prefix, which the Docker image tag omits)
 # and diff it against this copy before adopting any changes:
 #   curl -o docker-compose.yml \
@@ -12,7 +13,10 @@
 services:
   openclaw-gateway:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
-    build: .
+    build:
+      context: .
+      args:
+        OPENCLAW_VERSION: ${OPENCLAW_VERSION:-2026.7.1}
     env_file:
       - path: .env
         required: false

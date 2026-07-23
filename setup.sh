@@ -13,6 +13,11 @@ cd "$SCRIPT_DIR"
 log()  { printf '\n\033[1;36m==>\033[0m %s\n' "$1"; }
 fail() { printf '\033[1;31mERROR:\033[0m %s\n' "$1" >&2; exit 1; }
 
+# Single source of truth for the deployment's default model. Written into
+# openclaw.json (agents.defaults.model.primary) below. A plugged-in agent can
+# still override per-entry in agents.manifest.json5.
+DEFAULT_MODEL="anthropic/claude-sonnet-5"
+
 # --- args ---------------------------------------------------------------
 SYNC_AGENTS=0
 PRUNE_ARGS=()
@@ -37,6 +42,7 @@ done
 
 command -v docker >/dev/null 2>&1 || fail "docker not found. Install Docker first."
 docker compose version >/dev/null 2>&1 || fail "docker compose v2 not found."
+command -v jq >/dev/null 2>&1 || fail "jq not found. Install it first (also required by --sync-agents)."
 
 # --- 1. .env -----------------------------------------------------------
 if [[ ! -f .env ]]; then
@@ -77,7 +83,7 @@ chmod 600 .env
 
 # OPENCLAW_HOME_VOLUME is intentionally NOT required — it's an optional override.
 # Left unset, the home volume auto-namespaces to <COMPOSE_PROJECT_NAME>_home.
-for var in OPENCLAW_IMAGE OPENCLAW_CONFIG_DIR OPENCLAW_WORKSPACE_DIR \
+for var in OPENCLAW_VERSION OPENCLAW_IMAGE OPENCLAW_CONFIG_DIR OPENCLAW_WORKSPACE_DIR \
            OPENCLAW_AUTH_PROFILE_SECRET_DIR \
            OPENCLAW_GATEWAY_BIND COMPOSE_FILE; do
   grep -qE "^${var}=.+" .env || fail "$var is not set in .env. Edit it manually (see .env.example), then re-run this script."
@@ -97,7 +103,14 @@ if ! docker compose pull openclaw-gateway; then
   docker compose build openclaw-gateway ||
     fail "Could not pull or build the OpenClaw image. Check OPENCLAW_IMAGE in .env, your network connection, and (if building) the Dockerfile."
 fi
-IMAGE_RESOLVED=$(docker compose config 2>/dev/null | grep -m1 'image:' | awk '{print $2}')
+# Not a `docker compose config | grep -m1` pipe: grep -m1 exits the instant it
+# finds a match, closing its end of the pipe early; docker compose config then
+# hits a broken-pipe write and can exit non-zero, which `pipefail` reports as
+# the pipeline's exit status even though config generation actually succeeded.
+# Capture the gateway service's own image (not just the first "image:" match,
+# which depends on COMPOSE_FILE service ordering) via jq instead.
+IMAGE_RESOLVED=$(docker compose config --format json 2>/dev/null \
+  | jq -r '.services["openclaw-gateway"].image // empty')
 [[ "$IMAGE_RESOLVED" != "openclaw:local" ]] || fail "OPENCLAW_IMAGE still resolves to openclaw:local — check .env."
 
 # --- 3. Data dirs, with the Linux uid-1000 permission fix -----------------
@@ -159,7 +172,8 @@ else
   echo
   echo "    cd '$SCRIPT_DIR' && docker compose run --rm -it --entrypoint sh openclaw-cli -lc '/home/node/.local/bin/claude auth login'"
   echo
-  read -r -p "Press Enter once login is complete... " _
+  read -r -p "Press Enter once login is complete... " _ \
+    || fail "No interactive terminal to wait for login (stdin closed/EOF — this script's login step cannot run non-interactively). Complete the login command above, then re-run this script."
   claude_logged_in || fail "Claude CLI still not authenticated. Re-run this script after logging in."
 fi
 
@@ -174,9 +188,9 @@ docker compose run --rm --no-deps --entrypoint node openclaw-gateway \
   --non-interactive --accept-risk --auth-choice anthropic-cli \
   --gateway-bind loopback --skip-channels --skip-skills --skip-hooks --skip-search --skip-health
 
-log "Setting default model to anthropic/claude-sonnet-5"
+log "Setting default model to ${DEFAULT_MODEL}"
 docker compose run --rm openclaw-cli config set \
-  agents.defaults.model.primary anthropic/claude-sonnet-5
+  agents.defaults.model.primary "${DEFAULT_MODEL}"
 
 # Pin the FULL claude-cli backend. Setting only `.command` leaves the backend
 # without its `args`, so agents launch with no `--allowedTools mcp__openclaw__*`
@@ -201,7 +215,7 @@ sleep 5
 # --- 8. Verify end to end --------------------------------------------------
 log "Running end-to-end verification"
 RESULT=$(docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
-  --agent main --message "Reply with exactly: SETUP_SCRIPT_OK" --json --timeout 60)
+  --agent main --message "Reply with exactly: SETUP_SCRIPT_OK" --json --timeout 60) || true
 
 if [[ "$RESULT" == *'"winnerProvider": "claude-cli"'* && "$RESULT" == *'SETUP_SCRIPT_OK'* ]]; then
   log "SUCCESS — agent responded correctly via claude-cli."

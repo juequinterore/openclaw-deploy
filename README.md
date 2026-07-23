@@ -6,13 +6,14 @@ each maintained in its own external git repo. One Slack channel (or local
 terminal), one bot — behind the scenes, the coordinator routes each request to
 whichever specialist actually handles it.
 
-This repo currently wires in three specialists as a worked example:
+This repo ships as a **template**: one specialist wired in live by default,
+plus two commented-out worked examples showing real, richer specialists.
 
 | Agent | What it does |
 |---|---|
-| `echo-bot` | Reference/demo specialist — echoes back whatever it's sent. No real capability, no external deps. Used as the offline smoke test. |
-| `sallie` | Event lead intake: scores leads, pushes contacts/notes to HubSpot. |
-| `virginia` | Company research: builds an executive one-pager (PDF + editable HTML) and a ready-to-send cold email (`cold-email.md`). |
+| `echo-bot` | Reference/demo specialist — echoes back whatever it's sent. No real capability, no external deps. Used as the offline smoke test. **Live by default.** |
+| `sallie` (commented example) | Event lead intake: scores leads, pushes contacts/notes to HubSpot. |
+| `virginia` (commented example) | Company research: builds an executive one-pager (PDF + editable HTML) and a ready-to-send cold email (`cold-email.md`). |
 
 If you're just here to run it, skip to **Quick start**. If you're plugging in
 your own agent, skip to **Adding your agent**.
@@ -30,9 +31,13 @@ your own agent, skip to **Adding your agent**.
                  ▼           ▼           ▼
             ┌─────────┐ ┌─────────┐ ┌─────────┐
             │echo-bot │ │ sallie  │ │virginia │   specialists — isolated runs
-            │(coding) │ │(coding) │ │(coding) │   using each agent's own
+            │(live)   │ │(example)│ │(example)│   using each agent's own
             └─────────┘ └─────────┘ └─────────┘   workspace, persona, and memory
 ```
+
+Only `echo-bot` is wired in by default; `sallie`/`virginia` are commented-out
+worked examples in `agents.manifest.json5` showing what a real, richer
+specialist entry looks like — uncomment and pin a real ref to enable them.
 
 - **One deployment = one gateway container**, running the OpenClaw Gateway
   image via Docker Compose, talking to the model through **Claude CLI OAuth**
@@ -84,7 +89,7 @@ Talk to it once it's up:
 # Headless dispatch smoke check (real channels provide the complete push UX)
 docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
   --agent main --message "Please have the echo specialist repeat back: banana" \
-  --json --timeout 60
+  --json --timeout 120
 
 # Interactive local terminal chat (requester-bound push does not work here)
 docker compose run --rm -it openclaw-cli chat
@@ -111,7 +116,7 @@ in with `ssh -N -L 18789:127.0.0.1:18789 user@host` and browse the same
 
 Chatting with `main` here exercises real delegation (unlike the local `chat`
 command above) — this is the easiest way to see the coordinator route to
-echo-bot/sallie/virginia end to end.
+echo-bot (or any specialists you've plugged in) end to end.
 
 **Revert** when done — this is an admin surface (chat, config, exec
 approvals) and shouldn't stay enabled by default:
