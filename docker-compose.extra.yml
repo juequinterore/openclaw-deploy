@@ -8,16 +8,35 @@ services:
     # against upstream docker-compose.yml changes.
     ports: !reset []
     volumes:
+      # Named volume for /home/node so the Claude CLI install + its OAuth login
+      # survive container recreation. The real volume name is set via the
+      # top-level `volumes:` block below (see the note there).
       - "openclaw_home:/home/node"
-      - "./.openclaw-data/config:/home/node/.openclaw"
-      - "./.openclaw-data/workspace:/home/node/.openclaw/workspace"
-      - "./.openclaw-data/auth-secrets:/home/node/.config/openclaw"
+      # Project-local data dirs. Sources come from .env (the values documented
+      # in .env.example / DEPLOYMENT.md), falling back to ./.openclaw-data/*
+      # so the deployment still works project-local even if a var is unset.
+      # Same container targets as the upstream base file, so these override its
+      # mounts rather than adding new ones.
+      - "${OPENCLAW_CONFIG_DIR:-./.openclaw-data/config}:/home/node/.openclaw"
+      - "${OPENCLAW_WORKSPACE_DIR:-./.openclaw-data/workspace}:/home/node/.openclaw/workspace"
+      - "${OPENCLAW_AUTH_PROFILE_SECRET_DIR:-./.openclaw-data/auth-secrets}:/home/node/.config/openclaw"
   openclaw-cli:
     volumes:
       - "openclaw_home:/home/node"
-      - "./.openclaw-data/config:/home/node/.openclaw"
-      - "./.openclaw-data/workspace:/home/node/.openclaw/workspace"
-      - "./.openclaw-data/auth-secrets:/home/node/.config/openclaw"
+      - "${OPENCLAW_CONFIG_DIR:-./.openclaw-data/config}:/home/node/.openclaw"
+      - "${OPENCLAW_WORKSPACE_DIR:-./.openclaw-data/workspace}:/home/node/.openclaw/workspace"
+      - "${OPENCLAW_AUTH_PROFILE_SECRET_DIR:-./.openclaw-data/auth-secrets}:/home/node/.config/openclaw"
 
 volumes:
+  # Per-deployment home volume for the Claude CLI install + its OAuth login.
+  # The real Docker volume name resolves in this precedence (highest first):
+  #   1. OPENCLAW_HOME_VOLUME  — set it to pin an exact volume (e.g. to attach
+  #      one restored from a backup on another host).
+  #   2. <COMPOSE_PROJECT_NAME>_home  — the default. COMPOSE_PROJECT_NAME
+  #      defaults to the deploy directory's name, so every deployment gets its
+  #      own home volume and two agents on one host never share a Claude login.
+  #   3. openclaw_home  — only if the project name is somehow empty.
+  # The in-service mount keeps the fixed `openclaw_home` alias, so it always
+  # resolves to this entry no matter what the resulting name is.
   openclaw_home:
+    name: ${OPENCLAW_HOME_VOLUME:-${COMPOSE_PROJECT_NAME:-openclaw}_home}

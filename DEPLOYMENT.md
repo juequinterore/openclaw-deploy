@@ -9,6 +9,13 @@ upstream.
 This is a companion to `docs.openclaw.ai`, not a replacement — it only
 covers decisions and config specific to this instance.
 
+It also doubles as a **template**: one deployment runs one agent, and you copy
+it once per agent — on the same VPS or on separate VPSs (see "Running multiple
+agents on one host"). For a single agent that transparently routes to persistent
+specialists behind one Slack channel, see "Single point of contact → persistent
+specialists" — that's a config feature of a *single* deployment (try
+`./setup.sh --agents`), not multiple deployments.
+
 ## Repo structure
 
 ```
@@ -75,8 +82,9 @@ Then edit `.env`:
 - Set `OPENCLAW_GATEWAY_TOKEN` (generate with `openssl rand -hex 32`).
 - Uncomment and keep the `OPENCLAW_IMAGE`, `OPENCLAW_CONFIG_DIR`,
   `OPENCLAW_WORKSPACE_DIR`, `OPENCLAW_AUTH_PROFILE_SECRET_DIR`,
-  `OPENCLAW_HOME_VOLUME`, `OPENCLAW_GATEWAY_BIND`, and `COMPOSE_FILE` lines
-  as documented in `.env.example`.
+  `OPENCLAW_GATEWAY_BIND`, and `COMPOSE_FILE` lines as documented in
+  `.env.example`. (Leave the "Multi-agent / advanced" block commented unless
+  you're running several agents on one host.)
 
 ```bash
 docker compose pull openclaw-gateway
@@ -168,7 +176,7 @@ guarantees a fresh read).
 ```bash
 docker compose down
 ```
-This does not delete `.openclaw-data/` or the `openclaw_home` volume — your
+This does not delete `.openclaw-data/` or the home volume — your
 config, sessions, and Claude CLI login all survive.
 
 **Interactive terminal chat:**
@@ -209,11 +217,16 @@ OPENCLAW_IMAGE=ghcr.io/openclaw/openclaw:2026.6.11   # pinned version, not :late
 OPENCLAW_CONFIG_DIR=./.openclaw-data/config
 OPENCLAW_WORKSPACE_DIR=./.openclaw-data/workspace
 OPENCLAW_AUTH_PROFILE_SECRET_DIR=./.openclaw-data/auth-secrets
-OPENCLAW_HOME_VOLUME=openclaw_home                   # persists Claude CLI install+login
 OPENCLAW_GATEWAY_BIND=loopback                       # no inbound network exposure
 OPENCLAW_GATEWAY_TOKEN=<generate with: openssl rand -hex 32>
 COMPOSE_FILE=docker-compose.yml:docker-compose.extra.yml
 ```
+These are the lines `setup.sh` auto-fills. Two more, in the "Multi-agent /
+advanced" block, stay commented and are only for running several agents on one
+host (see that section): `COMPOSE_PROJECT_NAME` (defaults to the deploy
+directory name; namespaces containers and the `<project>_home` volume) and
+`OPENCLAW_HOME_VOLUME` (override the home volume's exact name).
+
 Provider API keys (`ANTHROPIC_API_KEY` etc., near the top of `.env.example`)
 are left commented out on purpose — auth flows through the Claude CLI's own
 OAuth session instead.
@@ -222,8 +235,14 @@ OAuth session instead.
 
 Adds, on top of the vendored base compose file:
 - `openclaw_home:/home/node` (named volume) on both services, so the Claude
-  CLI install and its credentials survive container recreation.
-- Explicit bind mounts for config/workspace/auth-secrets pointing at
+  CLI install and its credentials survive container recreation. The real
+  volume name is `<COMPOSE_PROJECT_NAME>_home` (project name defaults to the
+  deploy directory), so each deployment gets its own home volume — two agents
+  on one host never share a login. Set `OPENCLAW_HOME_VOLUME` to override with
+  an exact name (e.g. to attach a volume restored from a backup).
+- Bind mounts for config/workspace/auth-secrets, sourced from
+  `OPENCLAW_CONFIG_DIR` / `OPENCLAW_WORKSPACE_DIR` /
+  `OPENCLAW_AUTH_PROFILE_SECRET_DIR` in `.env`, defaulting to
   `./.openclaw-data/...` (project-local instead of `~/.openclaw`).
 - `ports: !reset []` on `openclaw-gateway` — clears the base file's port
   publishing. With `gateway.bind: loopback`, the app only listens on the
@@ -240,6 +259,13 @@ Key settings, set via `openclaw config set` / `onboard`:
   a direct API call.
 - `agents.defaults.cliBackends.claude-cli.command`:
   `"/home/node/.local/bin/claude"`
+- `agents.defaults.cliBackends.claude-cli.args` / `.resumeArgs`: the full launch
+  flags, including `--allowedTools mcp__openclaw__*`. **Setting only `.command`
+  is not enough** — without these args the CLI process is launched with no
+  allowlist, so **no `mcp__openclaw__*` tools are exposed** and any agent that
+  needs a tool (e.g. a coordinator calling `sessions_send`) has nothing to work
+  with. A lone agent that only answers still works, which can mask the problem.
+  `setup.sh` pins these automatically.
 - `gateway.mode`: `"local"`, `gateway.bind`: `"loopback"`
 
 To switch the default model:
@@ -261,19 +287,29 @@ regenerated or re-supplied on each machine:
 2. **`.openclaw-data/`** — gitignored. Either copy it from another machine if
    you want to carry over config/sessions/history, or omit it and run
    onboarding fresh (see "First-time setup" above).
-3. **The `openclaw_home` Docker volume** — a *named volume*, local to the
-   Docker daemon it was created on. It does **not** transfer via `git clone`
-   or a file copy. Re-authenticate from scratch on the new machine (the
-   "First-time setup" commands above), or migrate the volume's contents:
+3. **The home Docker volume** — a *named volume*, local to the Docker daemon it
+   was created on. It does **not** transfer via `git clone` or a file copy.
+   Its real name is `<COMPOSE_PROJECT_NAME>_home` (the project name defaults to
+   the deploy directory), so resolve it once and reuse it below. Re-authenticate
+   from scratch on the new machine (the "First-time setup" commands above), or
+   migrate the volume's contents:
    ```bash
+   # resolve the real volume name from the running config (works on both hosts)
+   VOL=$(docker compose config --format json | \
+     python3 -c 'import json,sys;print(json.load(sys.stdin)["volumes"]["openclaw_home"]["name"])')
+
    # on the old machine
-   docker run --rm -v openclaw_home:/v -v "$PWD":/backup alpine \
+   docker run --rm -v "$VOL":/v -v "$PWD":/backup alpine \
      tar czf /backup/openclaw_home.tgz -C /v .
-   # copy openclaw_home.tgz to the new machine, then:
-   docker volume create openclaw_home
-   docker run --rm -v openclaw_home:/v -v "$PWD":/backup alpine \
+   # copy openclaw_home.tgz to the new machine, then (from its deploy dir):
+   VOL=$(docker compose config --format json | \
+     python3 -c 'import json,sys;print(json.load(sys.stdin)["volumes"]["openclaw_home"]["name"])')
+   docker volume create "$VOL"
+   docker run --rm -v "$VOL":/v -v "$PWD":/backup alpine \
      tar xzf /backup/openclaw_home.tgz -C /v
    ```
+   (If you set `OPENCLAW_HOME_VOLUME` to the same value in both `.env` files,
+   the name is fixed and you can skip the `VOL=` lookup.)
 4. **Docker + Compose v2** must be installed on the new machine.
 5. If the new machine needs *inbound* access (e.g. laptop-to-remote-gateway,
    unlike the VPS setup below which needs none) — see "Direct Internet vs.
@@ -404,6 +440,288 @@ delegated tool authority. Consider allowlisting/mention-gating
 (`docs.openclaw.ai/gateway/security`) if that's not desired for your
 workspace.
 
+## Running multiple agents on one host
+
+One deployment runs one agent. To run several **independent** agents (e.g. each
+connected to a different Slack workspace), stamp out one copy per agent — the
+cleanest model, with fully isolated state, secrets, sessions, and upgrade
+lifecycle. On *separate* VPSs there's nothing extra to do (separate Docker
+daemons). On the *same* host, give each deployment a distinct identity so
+containers and the home volume don't collide:
+
+```bash
+# One directory per agent — the directory name becomes COMPOSE_PROJECT_NAME,
+# which namespaces containers and the `<project>_home` volume automatically.
+git clone <this-repo-url> openclaw-support
+git clone <this-repo-url> openclaw-sales
+cd openclaw-support && ./setup.sh    # own .env, own gateway token, own volume
+cd ../openclaw-sales  && ./setup.sh
+```
+
+- **Distinct directory names are enough** — `COMPOSE_PROJECT_NAME` defaults to
+  the directory name, so `openclaw-support` and `openclaw-sales` get separate
+  containers (`openclaw-support-openclaw-gateway-1`, …) and separate home
+  volumes (`openclaw-support_home`, `openclaw-sales_home`). If two clones would
+  share a directory name, set `COMPOSE_PROJECT_NAME` explicitly in each `.env`
+  (it's in the "Multi-agent / advanced" block of `.env.example`).
+- **Each agent is its own Slack app** — a separate bot + app token, added via
+  `channels add` into that deployment's own config. There's no shared routing.
+- **Data is already isolated** — each deployment's `./.openclaw-data/` and
+  `.env` live in its own directory; nothing is shared between agents.
+- **Ports never conflict** — loopback bind + `ports: !reset []` means no host
+  ports are published, so any number of agents coexist.
+- **Verify isolation** before relying on it:
+  `docker compose config | grep -E 'name:|container_name'` in each directory
+  should show distinct volume/container names.
+
+## Subagents: stateless parallel fan-out (optional)
+
+Subagents are a *different* mechanism from the coordinator pattern below: a
+running agent spawns **ephemeral background runs** with `sessions_spawn` to
+parallelize discrete tasks. Use them for stateless fan-out (e.g. "review these
+five files at once"), **not** for a persistent front desk — for "one Slack
+contact routing to persistent specialists" use the relay pattern in "Single
+point of contact → persistent specialists" below (it keeps specialist memory
+and needs no elevated tool profile).
+
+Enable it on the agent that will spawn. Note `sessions_spawn` requires the
+`coding` or `full` tool profile — a `messaging`-profile agent has no spawn tool:
+
+```bash
+docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
+{ "agents": { "list": [ { "id": "main", "tools": { "profile": "full" },
+  "subagents": { "delegationMode": "prefer", "allowAgents": ["*"],
+                 "model": "anthropic/claude-haiku-4-5", "maxConcurrent": 8 } } ] } }
+JSON
+docker compose restart openclaw-gateway
+```
+
+Keep in mind:
+
+- **Sizing.** Subagents are concurrent `claude` CLI processes inside the one
+  container (up to `maxConcurrent`), each with its own context and token spend —
+  a subagent-heavy deployment wants a larger VPS; a cheaper child `model` helps.
+- **Optional sandboxing.** For sandboxed children (`sandbox: require`), uncomment
+  the `/var/run/docker.sock` mount and `group_add`/`DOCKER_GID` block in
+  `docker-compose.yml`. Not needed for the default (logical session isolation).
+- **Slack caveat.** Announce-back to the requester conversation works, but
+  persistent thread-binding of follow-ups to a specific subagent is
+  Discord/iMessage/Matrix/Telegram only — on Slack the parent re-dispatches each
+  turn. See `docs.openclaw.ai/tools/subagents`.
+
+## Single point of contact → persistent specialists (coordinator pattern)
+
+Goal: one Slack channel (or TUI session) where the user talks to a single "front
+desk" agent that routes each request to the right specialist — transparently,
+with specialists keeping their own memory across turns. This is a **single
+deployment** of this template: every agent runs in one gateway, shares one
+Claude CLI login, and adds no infrastructure.
+
+**The mechanism (what actually works on Slack):** the coordinator relays via
+**cross-agent messaging**, not subagent spawning. It calls `sessions_send` to
+hand the request to a specialist's own session (waiting for the reply), then
+relays that reply to the user in its normal channel message. Because the
+coordinator owns the outbound reply, this is channel-agnostic — no Slack
+thread-binding caveats.
+
+> **Critical:** `sessions_send` is **not** part of the `messaging` (or any) tool
+> profile — a profile alone will **not** expose it, and the coordinator will
+> silently fall back to non-OpenClaw tooling and fail to route. You must grant it
+> explicitly on the coordinator with `tools.allow: ["sessions_list",
+> "sessions_history", "sessions_send"]`. This is the single most common reason a
+> coordinator "sees" its specialists (via the read tools) but never dispatches to
+> them.
+
+### Quickest path: `./setup.sh --agents`
+
+Re-run setup with the flag to scaffold a working coordinator plus a throwaway
+`echo-bot` specialist, wired with the enabling keys:
+
+```bash
+./setup.sh --agents
+```
+
+It's idempotent — if agents are already configured (`tools.agentToAgent.enabled`
+is `true`) it skips the scaffold. It provisions:
+
+- **`main`** — the coordinator: `default: true` (front door for unrouted
+  messages), with `tools.allow: [sessions_list, sessions_history, sessions_send]`
+  (explicitly granting the relay tool — no profile), and an `AGENTS.md` telling it
+  to relay echo requests to `echo-bot` via `sessions_send`.
+- **`echo-bot`** — a persistent specialist whose replies start with the sentinel
+  `ECHO-BOT>>`.
+- the three enabling keys (below), and it verifies `echo-bot` responds before
+  finishing.
+
+Then confirm dispatch (no Slack needed). Use a **fresh `--session`** — existing
+sessions load their persona at creation, so one created before the scaffold (the
+setup verify's `main` session) won't have the coordinator instructions and will
+just answer directly:
+
+```bash
+docker compose run --rm -it openclaw-cli chat --session desk1
+#   › echo: banana
+#   › expect the reply to contain  ECHO-BOT>> banana   (main relayed it)
+```
+
+### What gets configured (and why)
+
+The scaffold applies this via `config patch` (validated merge), using the
+container's mounted paths:
+
+```json5
+{
+  agents: {
+    defaults: { /* model + claude-cli runtime from setup.sh — leave as-is */ },
+    list: [
+      { id: "main", default: true,           // front door: unrouted messages land here
+        tools: { allow: ["sessions_list", "sessions_history", "sessions_send"] }, // grant the relay tool explicitly
+        workspace: "/home/node/.openclaw/workspace" },
+      { id: "echo-bot",                        // a persistent specialist (own session/memory)
+        tools: { profile: "messaging" },       // specialists that touch files/exec use "coding"
+        workspace: "/home/node/.openclaw/agents/echo-bot/workspace" }
+    ]
+  },
+  tools: {
+    sessions:     { visibility: "all" },       // let main see/target other agents' sessions
+    agentToAgent: { enabled: true, allow: ["*"] } // permit cross-agent calls; scope `allow` to tighten
+  },
+  session: { agentToAgent: { maxPingPongTurns: 2 } } // reply-back turns (0-20; 0 = single exchange)
+}
+```
+
+The four enabling keys, verified against `openclaw config schema`:
+
+- **`agents.list[main].tools.allow` includes `sessions_send`** — the coordinator
+  can only relay if the tool is explicitly granted. `sessions_send` is in **no**
+  profile, so `tools.profile` alone leaves the coordinator unable to dispatch.
+  This is the key most easily missed.
+- **`tools.sessions.visibility: "all"`** — scope for `sessions_list/history/send`
+  (`self` < `tree` (default) < `agent` < `all`). `all` lets the coordinator
+  target other agents' sessions.
+- **`tools.agentToAgent.enabled: true` + `allow: ["*"]`** — permits an agent to
+  invoke another at runtime; `allow` is the target allowlist (use explicit ids
+  to tighten).
+- **`session.agentToAgent.maxPingPongTurns`** — after the specialist replies, how
+  many reply-back turns the two agents may alternate (0–20, default 5). `0` =
+  one exchange, no follow-up loop.
+
+Routing is **prompt-driven**: the coordinator's `AGENTS.md` says which specialist
+handles what and to reach it with `sessions_send` (wait mode). The keys grant the
+capability; the persona makes the call.
+
+### How the round-trip works
+
+1. The user messages the coordinator (the `default` agent) on Slack or in the TUI.
+2. The coordinator picks a specialist and calls `sessions_send(key="agent:<id>:main",
+   message=request, timeoutMs=<wait>)`. A standing agent's session key has the form
+   `agent:<id>:main` (e.g. `agent:echo-bot:main`).
+3. The specialist runs in **its own persistent session** (keeps memory across
+   calls) and returns its answer inline to the coordinator.
+4. The coordinator relays that answer to the user in its own channel reply — the
+   user sees one bot.
+
+### Validating the coordinator (dashboard vs. local TUI)
+
+**Do not test the coordinator from the local `chat` TUI.** The interactive TUI
+registers as a restricted Gateway client and **withholds `sessions_send`** — you
+will see only `sessions_list`/`sessions_history`, and `main` reports that
+`sessions_send` "isn't available". Cross-session tools are exposed on the
+surfaces that matter — **headless `agent` runs, the dashboard, and Slack** — not
+the local TUI. (This is easy to mistake for a broken config; it isn't.)
+
+Two ways to validate:
+
+- **Headless one-shot** — the same check `setup.sh --agents` runs:
+  ```bash
+  docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
+    --agent main --message "echo: banana" --json --timeout 120
+  ```
+  Expect `ECHO-BOT>>` in the output.
+
+- **Dashboard (Control UI)** — to drive it by hand. The template binds the
+  gateway to loopback with no published port, so the dashboard is unreachable by
+  default. Opt into the bundled `docker-compose.dashboard.yml` override, which
+  publishes the port to the **host loopback only**:
+  ```bash
+  # macOS sed shown; on Linux drop the '' after -i
+  sed -i '' 's/^OPENCLAW_GATEWAY_BIND=.*/OPENCLAW_GATEWAY_BIND=lan/' .env
+  grep -q docker-compose.dashboard.yml .env || \
+    sed -i '' 's|^COMPOSE_FILE=.*|&:docker-compose.dashboard.yml|' .env
+  docker compose up -d openclaw-gateway     # up -d, not restart
+  ```
+  Then browse `http://127.0.0.1:18789/` (auth token = `OPENCLAW_GATEWAY_TOKEN`
+  from `.env`). On a **remote** host do NOT publish beyond loopback — keep the
+  override and tunnel in: `ssh -N -L 18789:127.0.0.1:18789 user@host`.
+
+  **Revert** to the locked-down default afterwards: remove
+  `:docker-compose.dashboard.yml` from `COMPOSE_FILE`, set
+  `OPENCLAW_GATEWAY_BIND=loopback`, then `docker compose up -d openclaw-gateway`.
+  The Control UI is an admin surface (chat, config, exec approvals) — never bind
+  it to `0.0.0.0`.
+
+### Adding real specialists
+
+1. Add an `agents.list[]` entry with its own `id`, an `identity.name`, a
+   `workspace` under `/home/node/.openclaw/...`, and a `tools.profile` (`coding`
+   if it needs files/exec, `messaging` if it only talks). Add its id to
+   `tools.agentToAgent.allow` unless you keep `["*"]`. `config patch` **replaces**
+   the whole `agents.list`, so include every agent you want to keep (check
+   `config get agents.list` first):
+   ```bash
+   docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
+   { "agents": { "list": [
+     { "id": "main", "default": true, "tools": { "profile": "messaging" }, "workspace": "/home/node/.openclaw/workspace" },
+     { "id": "billing", "tools": { "profile": "coding" }, "identity": { "name": "Billing" },
+       "workspace": "/home/node/.openclaw/agents/billing/workspace" }
+   ] } }
+   JSON
+   docker compose run --rm openclaw-cli config validate
+   ```
+2. Write the specialist's persona (its job) and add the routing rule to the
+   coordinator's `AGENTS.md`, both from inside the container (uid 1000):
+   ```bash
+   docker compose run --rm --entrypoint sh openclaw-cli -lc '
+     d=/home/node/.openclaw/agents/billing/workspace; mkdir -p "$d";
+     printf "%s\n" "# Billing specialist" "You answer billing questions. Be concise." > "$d/AGENTS.md" '
+   docker compose restart openclaw-gateway
+   ```
+
+### Prefer to route by identity instead of content?
+
+If different Slack channels/workspaces/users should map to different agents
+(rather than one agent dispatching by content), skip the coordinator and use
+top-level `bindings` — fully deterministic. See
+`docs.openclaw.ai/channels/channel-routing` (the `team`/`channel`/`peer` tiers
+cover Slack).
+
+### Or spawn ephemeral runs instead (`sessions_spawn`)
+
+The alternative to the relay pattern is subagent spawning: the coordinator calls
+`sessions_spawn` with `agentId` to run a **fresh** instance of a specialist (no
+cross-call memory), whose result announces back to the requester conversation.
+Use it for stateless, one-off fan-out. Two things differ:
+
+- the coordinator must be on the **`coding` or `full`** profile (`sessions_spawn`
+  isn't in `messaging`) — set `agents.list[main].tools.profile: "full"`, plus
+  `subagents: { delegationMode: "prefer", allowAgents: [...] }`; and
+- on Slack there's no persistent thread-binding (Discord/iMessage/Matrix/Telegram
+  only), so follow-ups re-dispatch.
+
+See `docs.openclaw.ai/tools/subagents`.
+
+### Things to review
+
+- **Routing quality** is only as good as the coordinator's `AGENTS.md` — be
+  explicit about which specialist owns which kind of request.
+- **Breadth:** `allow: ["*"]` and `visibility: "all"` are wide open — fine for a
+  single-operator box; scope `allow` to explicit ids for least privilege.
+- **`maxPingPongTurns: 0`** blocks a specialist from asking the coordinator a
+  clarifying follow-up; use 1–2 if specialists need to round-trip.
+- **Sizing:** each active agent is another concurrent `claude` process in the one
+  container — size the VPS, and point cheaper specialists at cheaper models
+  per-agent (`agents.list[].model`).
+
 ## Troubleshooting notes learned while setting this up
 
 - **`pull access denied for openclaw, repository does not exist`** —
@@ -442,7 +760,39 @@ workspace.
   publishing can't bridge that gap. Docker's internal healthcheck still
   works fine (it runs inside the container), and `openclaw-cli` still works
   (it shares the same network namespace).
+- **`config reload skipped (invalid config): agents.defaults: Unrecognized
+  keys: "list", "bindings"`** — a multi-agent edit put `list`/`bindings` inside
+  `agents.defaults`, which is a closed object. `agents.list` is a sibling of
+  `agents.defaults`, and `bindings` is a top-level key. The gateway kept the
+  previous valid config (nothing broke). Move the keys to the right level (see
+  "Single point of contact → persistent specialists"), or apply via `config
+  patch`, then `config validate` before restarting. Inspect the real schema any
+  time with `docker compose run --rm openclaw-cli config schema`.
+- **Coordinator says `sessions_spawn` isn't available (only `sessions_list` /
+  `sessions_history` / `sessions_yield`)** — its tool profile doesn't include
+  the spawn tool. `sessions_spawn` is in the `coding`/`full` profiles only; a
+  messaging/default-profile agent never gets it. Set
+  `agents.list[main].tools.profile: "full"` and restart. Verify inside the TUI
+  that `sessions_spawn` now appears before debugging anything else.
+- **Coordinator won't delegate — it says it "can't find the echo-bot session"
+  / can only see its own scope** — *after* the profile fix above, this is the
+  delegation gap: `allowAgents` without `delegationMode` gives no guidance. Set
+  `agents.list[main].subagents.delegationMode: "prefer"` **and** put an explicit
+  instruction in `main`'s workspace `AGENTS.md` ("spawn agentId `echo-bot` via
+  sessions_spawn for echo requests"). To test the plumbing independent of the
+  model's judgment, phrase the request as an explicit spawn:
+  `Use the sessions_spawn tool with agentId "echo-bot" to run: echo banana`,
+  then check `/subagents list`.
+- **Coordinator just answers directly / echoes instead of delegating** — you're
+  likely in a session created *before* the coordinator persona was applied
+  (e.g. the `main` session from setup's verify step, recognizable by leftover
+  `SETUP_SCRIPT_OK` history). Sessions load their agent persona at creation.
+  Start a fresh one: `docker compose run --rm -it openclaw-cli chat --session
+  desk1`. If a brand-new session still won't relay, force the tool to isolate
+  the cause: `Use the sessions_send tool to send "banana" to agent "echo-bot",
+  wait for the reply, and return it` — a working result means it's persona
+  wording, not plumbing.
 - **This repo has no `Dockerfile` and no application source, on purpose** —
   don't `git clone` the full `openclaw/openclaw` project expecting to find
-  more here; everything needed to run is these four files plus the pulled
-  image.
+  more here; everything needed to run is in this repo (the two compose files
+  plus your `.env`) alongside the pulled image.

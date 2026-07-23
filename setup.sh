@@ -13,6 +13,18 @@ cd "$SCRIPT_DIR"
 log()  { printf '\n\033[1;36m==>\033[0m %s\n' "$1"; }
 fail() { printf '\033[1;31mERROR:\033[0m %s\n' "$1" >&2; exit 1; }
 
+# --- args ---------------------------------------------------------------
+WITH_AGENTS=0
+for arg in "$@"; do
+  case "$arg" in
+    --agents|--with-agents) WITH_AGENTS=1 ;;
+    -h|--help)
+      printf 'Usage: ./setup.sh [--agents]\n\n  --agents  After the base setup, scaffold a coordinator (main) plus a\n            persistent echo-bot specialist wired for cross-agent messaging\n            (sessions_send + tools.agentToAgent). Idempotent; skips if agents\n            are already configured. See "Single point of contact" in\n            DEPLOYMENT.md.\n'
+      exit 0 ;;
+    *) fail "Unknown argument: $arg (try --help)" ;;
+  esac
+done
+
 command -v docker >/dev/null 2>&1 || fail "docker not found. Install Docker first."
 docker compose version >/dev/null 2>&1 || fail "docker compose v2 not found."
 
@@ -35,18 +47,28 @@ if ! grep -qE '^OPENCLAW_GATEWAY_TOKEN=.+' .env; then
 fi
 
 # Uncomment every "# KEY=value" line from the "Docker deployment overrides"
-# marker to end of file — that section is deliberately last in .env.example
-# so this range never touches unrelated commented examples earlier in the
-# file (e.g. the generic OPENCLAW_AUTH_PROFILE_SECRET_DIR placeholder under
-# "Gateway auth + paths").
-START_LINE=$(grep -n "Docker deployment overrides" .env | head -1 | cut -d: -f1 || true)
+# marker to end of file. That block is deliberately last in .env.example so the
+# range never touches unrelated commented examples earlier in the file (e.g. the
+# generic OPENCLAW_AUTH_PROFILE_SECRET_DIR placeholder under "Gateway auth +
+# paths"), nor the "Multi-agent / advanced" block just above the marker —
+# COMPOSE_PROJECT_NAME and OPENCLAW_HOME_VOLUME are meant to stay commented so
+# each deployment keeps its auto-namespaced defaults.
+START_LINE=$(grep -n "Docker deployment overrides (auto-configured" .env | head -1 | cut -d: -f1 || true)
 if [[ -n "${START_LINE:-}" ]]; then
   log "Uncommenting deployment-override variables in .env"
   sed -i.bak "${START_LINE},\$ s/^# \([A-Z_][A-Z0-9_]*=\)/\1/" .env && rm -f .env.bak
 fi
 
+# Lock down .env to owner-only — it holds the gateway token. Done last, after
+# the sed edits above: `sed -i` writes a fresh file and can reset the mode to
+# the umask default, so chmod here guarantees the final state is 0600.
+# Compose reads .env as the invoking user (the owner), so 0600 doesn't break it.
+chmod 600 .env
+
+# OPENCLAW_HOME_VOLUME is intentionally NOT required — it's an optional override.
+# Left unset, the home volume auto-namespaces to <COMPOSE_PROJECT_NAME>_home.
 for var in OPENCLAW_IMAGE OPENCLAW_CONFIG_DIR OPENCLAW_WORKSPACE_DIR \
-           OPENCLAW_AUTH_PROFILE_SECRET_DIR OPENCLAW_HOME_VOLUME \
+           OPENCLAW_AUTH_PROFILE_SECRET_DIR \
            OPENCLAW_GATEWAY_BIND COMPOSE_FILE; do
   grep -qE "^${var}=.+" .env || fail "$var is not set in .env. Edit it manually (see .env.example), then re-run this script."
 done
@@ -132,6 +154,22 @@ log "Setting default model to anthropic/claude-sonnet-4-6"
 docker compose run --rm openclaw-cli config set \
   agents.defaults.model.primary anthropic/claude-sonnet-4-6
 
+# Pin the FULL claude-cli backend. Setting only `.command` leaves the backend
+# without its `args`, so agents launch with no `--allowedTools mcp__openclaw__*`
+# — meaning NO OpenClaw MCP tools are exposed to the CLI process. A lone agent
+# still answers (it needs no tools), but a coordinator then has nothing to
+# delegate with. These args mirror the known-good partner config.
+log "Pinning full claude-cli backend args (command-only exposes no MCP tools)"
+docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
+{
+  "agents": { "defaults": { "cliBackends": { "claude-cli": {
+    "command": "/home/node/.local/bin/claude",
+    "args": ["-p","--output-format","stream-json","--include-partial-messages","--verbose","--setting-sources","user","--allowedTools","mcp__openclaw__*","--disallowedTools","ScheduleWakeup,CronCreate,Bash(run_in_background:true),Monitor"],
+    "resumeArgs": ["-p","--output-format","stream-json","--include-partial-messages","--verbose","--setting-sources","user","--allowedTools","mcp__openclaw__*","--disallowedTools","ScheduleWakeup,CronCreate,Bash(run_in_background:true),Monitor","--resume","{sessionId}"]
+  } } } }
+}
+JSON
+
 log "Restarting gateway to apply config"
 docker compose restart openclaw-gateway
 sleep 5
@@ -146,6 +184,70 @@ if [[ "$RESULT" == *'"winnerProvider": "claude-cli"'* && "$RESULT" == *'SETUP_SC
 else
   fail "Verification failed. Full output:
 $RESULT"
+fi
+
+# --- 9. Optional: scaffold the multi-agent coordinator (--agents) ---------
+if [[ "$WITH_AGENTS" -eq 1 ]]; then
+  log "Scaffolding multi-agent coordinator (--agents)"
+  # Idempotency probe reads the config file directly. Do NOT parse `config get`
+  # stdout here: it prints a banner, and (worse) its non-zero exit when the key
+  # is unset would abort this script under `set -e`/`pipefail` — an `if grep`
+  # condition is exempt from errexit and can't take the script down.
+  if grep -q '"agentToAgent"' .openclaw-data/config/openclaw.json 2>/dev/null; then
+    log "Agents already configured (agentToAgent present) — skipping scaffold"
+  else
+    log "Applying coordinator + echo-bot config"
+    docker compose run -T --rm openclaw-cli config patch --stdin <<'JSON'
+{
+  "agents": { "list": [
+    { "id": "main", "default": true,
+      "tools": { "allow": ["sessions_list", "sessions_history", "sessions_send"] },
+      "workspace": "/home/node/.openclaw/workspace" },
+    { "id": "echo-bot", "tools": { "profile": "messaging" },
+      "workspace": "/home/node/.openclaw/agents/echo-bot/workspace" }
+  ] },
+  "tools": {
+    "sessions": { "visibility": "all" },
+    "agentToAgent": { "enabled": true, "allow": ["*"] }
+  },
+  "session": { "agentToAgent": { "maxPingPongTurns": 2 } }
+}
+JSON
+    log "Writing coordinator + echo-bot personas (owned by uid 1000)"
+    docker compose run --rm --entrypoint sh openclaw-cli -lc '
+      m=/home/node/.openclaw/workspace; mkdir -p "$m";
+      printf "%s\n" "# Front desk (coordinator)" \
+        "You are a thin router. Never do specialist work yourself." \
+        "A specialist session key has the form agent:<id>:main." \
+        "RULE: Any message beginning with \"echo:\" MUST be relayed to echo-bot. Call sessions_send(key=\"agent:echo-bot:main\", message=\"<text after echo:>\", timeoutMs=120000) and return the reply from echo-bot verbatim. Never echo it yourself, even one word." > "$m/AGENTS.md";
+      e=/home/node/.openclaw/agents/echo-bot/workspace; mkdir -p "$e";
+      printf "%s\n" "# echo-bot" \
+        "You are a test specialist. Reply to EVERY message with exactly:" \
+        "ECHO-BOT>> <repeat the user message verbatim>" > "$e/AGENTS.md" '
+    docker compose run --rm openclaw-cli config validate
+    docker compose restart openclaw-gateway
+    sleep 5
+    log "Verifying the echo-bot specialist responds"
+    ER=$(docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
+      --agent echo-bot --message "banana" --json --timeout 60)
+    if [[ "$ER" == *'ECHO-BOT>>'* ]]; then
+      log "echo-bot OK. Verifying the coordinator relays to it via sessions_send"
+      # A one-shot `agent` run starts a fresh session, so main loads its
+      # coordinator persona (existing chat sessions predate it and won't relay).
+      CR=$(docker compose run --rm --entrypoint node openclaw-cli dist/index.js agent \
+        --agent main --message "echo: banana" --json --timeout 120)
+      if [[ "$CR" == *'ECHO-BOT>>'* ]]; then
+        log "Coordinator relay OK — main delegated to echo-bot and returned its reply."
+      else
+        log "WARNING: coordinator did not relay (no ECHO-BOT>> in its reply). Confirm main's"
+        log "tools.allow includes sessions_send and that its AGENTS.md loaded. Full output:"
+        log "$CR"
+      fi
+    else
+      fail "echo-bot did not respond as expected. Full output:
+$ER"
+    fi
+  fi
 fi
 
 log "Done. Try: docker compose run --rm -it openclaw-cli chat"
