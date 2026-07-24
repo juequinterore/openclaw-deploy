@@ -487,13 +487,31 @@ Requires a Slack app with **Socket Mode** enabled — a bot token (`xoxb-...`)
 and an app-level token (`xapp-...`) from api.slack.com.
 
 Easiest path: set `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` in `.env` *before*
-running `setup.sh` — it detects them and runs `channels add` for you
-(idempotent; skips if Slack is already configured). Otherwise, do it
-manually any time:
+running `setup.sh` — it detects them and wires Slack up for you (idempotent;
+skips if Slack is already configured). Otherwise, do it manually any time:
 ```bash
-docker compose run --rm openclaw-cli channels add --channel slack \
-  --bot-token "xoxb-..." --app-token "xapp-..."
+docker compose run --rm openclaw-cli plugins install @openclaw/slack
+docker compose run --rm openclaw-cli config set plugins.entries.slack.enabled true
+docker compose run --rm openclaw-cli config set channels.slack.botToken \
+  --ref-provider default --ref-source env --ref-id SLACK_BOT_TOKEN
+docker compose run --rm openclaw-cli config set channels.slack.appToken \
+  --ref-provider default --ref-source env --ref-id SLACK_APP_TOKEN
+docker compose run --rm openclaw-cli config set channels.slack.enabled true
+docker compose run --rm openclaw-cli config set channels.slack.mode socket
+docker compose restart openclaw-gateway
 ```
+Not `channels add --channel slack --bot-token ... --app-token ...`: reproduced
+on a genuinely fresh instance (own compose project + volume, no prior Slack
+config) that it fails there with `Channel "slack" does not support
+non-interactive add`, regardless of whether the plugin package is installed.
+Two things are actually required and neither is done by that command: (1) the
+Slack plugin package must be installed (`plugins install`), and (2) even
+installed, the gateway logs — not any CLI command's stdout — show the real
+blocker: `external plugin "slack" is installed without explicit trust. Add
+plugins.entries.slack.enabled=true.` The sequence above (also what `setup.sh`
+runs) is the one docs/channels/slack.md documents as the scriptable
+alternative, and has the added benefit of referencing the container's env var
+rather than copying the token into `openclaw.json` as plaintext.
 
 ### 6. Terminal access, going forward
 ```bash

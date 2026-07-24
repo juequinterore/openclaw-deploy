@@ -228,25 +228,55 @@ fi
 # .env.example ships SLACK_BOT_TOKEN/SLACK_APP_TOKEN commented out under
 # "Optional channel env fallbacks" — nothing forwards them into the container
 # or the gateway config on its own. If the user has uncommented and filled
-# them in, do the `channels add` step for them here instead of leaving it as
-# a manual DEPLOYMENT.md step. Passed via `docker compose run -e` (not added
-# to docker-compose.yml's `environment:` block) since that file is vendored
-# from upstream and diffed on every version bump — keeping it untouched
-# avoids upgrade-diff noise for a repo-local convenience step.
+# them in, wire Slack up here instead of leaving it as a manual DEPLOYMENT.md
+# step.
+#
+# NOT using `channels add --channel slack --bot-token ... --app-token ...`:
+# reproduced on a genuinely fresh instance (own compose project + volume, no
+# prior Slack config) that it fails there with "Channel \"slack\" does not
+# support non-interactive add" regardless of whether the plugin is installed.
+# Two things are actually required and neither is done by that command:
+#   1. The Slack plugin package must be installed (`plugins install`).
+#   2. Even installed, the gateway logs (not any CLI command's stdout) show
+#      the real blocker: "external plugin \"slack\" is installed without
+#      explicit trust. Add plugins.entries.slack.enabled=true." — a plugin
+#      trust flag distinct from channels.slack.enabled.
+# Verified end-to-end on a clean instance: install the plugin, set the trust
+# flag, then set channels.slack.{botToken,appToken,enabled,mode} via
+# `config set` (docs/channels/slack.md's documented scriptable alternative;
+# same non-interactive mechanism setup.sh already uses for
+# cliBackends.claude-cli above). `--ref-source env --ref-id ...` stores a
+# live reference to the container's env var rather than a plaintext copy in
+# openclaw.json; both services' `env_file: .env` already forwards
+# SLACK_BOT_TOKEN/SLACK_APP_TOKEN into the container, so no
+# docker-compose.yml changes or extra `-e` flags are needed.
 if grep -qE '^SLACK_BOT_TOKEN=.+' .env && grep -qE '^SLACK_APP_TOKEN=.+' .env; then
   SLACK_STATUS=$(docker compose run --rm openclaw-cli channels list 2>/dev/null | grep -i '^- Slack' || true)
   if [[ "$SLACK_STATUS" == *"configured"* && "$SLACK_STATUS" != *"not configured"* ]]; then
     log "Slack already configured, skipping (channels list: ${SLACK_STATUS})"
   else
     log "SLACK_BOT_TOKEN/SLACK_APP_TOKEN found in .env — wiring up Slack"
-    SLACK_BOT_TOKEN=$(grep -E '^SLACK_BOT_TOKEN=' .env | head -1 | cut -d= -f2-)
-    SLACK_APP_TOKEN=$(grep -E '^SLACK_APP_TOKEN=' .env | head -1 | cut -d= -f2-)
-    docker compose run --rm openclaw-cli channels add --channel slack \
-      --bot-token "$SLACK_BOT_TOKEN" --app-token "$SLACK_APP_TOKEN" \
-      || fail "Slack channel setup failed. Check SLACK_BOT_TOKEN/SLACK_APP_TOKEN in .env."
+    docker compose run --rm openclaw-cli plugins install @openclaw/slack \
+      || log "plugins install @openclaw/slack: non-zero exit (often already-installed on a re-run; continuing)"
+    docker compose run --rm openclaw-cli config set plugins.entries.slack.enabled true \
+      || fail "Slack config set (plugins.entries.slack.enabled) failed."
+    docker compose run --rm openclaw-cli config set channels.slack.botToken \
+      --ref-provider default --ref-source env --ref-id SLACK_BOT_TOKEN \
+      || fail "Slack config set (botToken) failed."
+    docker compose run --rm openclaw-cli config set channels.slack.appToken \
+      --ref-provider default --ref-source env --ref-id SLACK_APP_TOKEN \
+      || fail "Slack config set (appToken) failed."
+    docker compose run --rm openclaw-cli config set channels.slack.enabled true \
+      || fail "Slack config set (enabled) failed."
+    docker compose run --rm openclaw-cli config set channels.slack.mode socket \
+      || fail "Slack config set (mode) failed."
     log "Slack configured. Restarting gateway to apply."
     docker compose restart openclaw-gateway
     sleep 5
+    SLACK_STATUS=$(docker compose run --rm openclaw-cli channels list 2>/dev/null | grep -i '^- Slack' || true)
+    [[ "$SLACK_STATUS" == *"configured"* && "$SLACK_STATUS" != *"not configured"* ]] \
+      || fail "Slack setup completed but channels list still reports not configured: ${SLACK_STATUS}"
+    log "Slack verified: ${SLACK_STATUS}"
   fi
 else
   log "No SLACK_BOT_TOKEN/SLACK_APP_TOKEN in .env, skipping Slack setup (see 'Wire up Slack' in DEPLOYMENT.md)"
