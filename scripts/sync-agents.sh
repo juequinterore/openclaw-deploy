@@ -185,8 +185,10 @@ collect_env_names() {
 
 # Install a materialized agent's npm skill dependencies INSIDE the image
 # (AGENTS-PLUGINS.md §7.1) so node_modules is Linux-native and (on Linux) ends
-# up uid-1000-owned like the rest of the workspace after the chown below. The
-# container path mirrors the host dst under the config-dir mount. `npm ci` is
+# up uid-1000-owned like the rest of the workspace — the caller chowns the tree
+# to uid 1000 BEFORE calling this, so the in-image `node` user (uid 1000) can
+# write node_modules. The container path mirrors the host dst under the
+# config-dir mount. `npm ci` is
 # used — deterministic from the committed lockfile — with lifecycle scripts
 # OFF unless the deployer opted in via the manifest's `allowInstallScripts`.
 install_skill_deps() {
@@ -256,8 +258,9 @@ lock_is_fully_pinned() {
 # tool cwd, so every pyproject.toml/requirements*.txt found anywhere under the
 # workspace installs into the SAME site (unlike node_modules, which Node's own
 # resolver finds per-directory — Python needs no per-directory site). Runs
-# in-image, after copy and before the Linux chown, so wheels are Linux-native
-# and end up uid-1000-owned like the rest of the workspace.
+# in-image after copy, and after the caller has chowned the tree to uid 1000
+# (so the `node` user can write .python-site), so wheels are Linux-native and
+# end up uid-1000-owned like the rest of the workspace.
 #
 # A pinned lock (requirements.lock, or a fully-pinned requirements.txt) is
 # PREFERRED but no longer required (§3.2): when present, the full set installs
@@ -617,23 +620,28 @@ for row in "${EFF_ROWS[@]}"; do
   else
     rm -f "$dst/DISABLED_FEATURES.md"
   fi
+  # On Linux the copy above ran as the host user (often root), so the tree is
+  # NOT owned by uid 1000. The dep installs below run in-image as `node`
+  # (uid 1000) and must create node_modules / .python-site INSIDE this tree —
+  # that fails with EACCES unless ownership is handed over FIRST. So chown this
+  # agent's workspace to uid 1000 now, before install_skill_deps/python_deps,
+  # not after the whole loop.
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    # Skip the chown (and its sudo prompt) when ownership is already right.
+    if [[ -n "$(find "$dst" ! \( -uid 1000 -gid 1000 \) -print -quit)" ]]; then
+      log "    Linux: chowning $id workspace to uid 1000 (before dep install)"
+      if [[ "$(id -u)" -eq 0 ]]; then chown -R 1000:1000 "$dst"
+      else sudo chown -R 1000:1000 "$dst"; fi
+    fi
+  fi
   # Install any npm-based / Python skill deps that shipped a lockfile. Runs on
   # the just-copied tree (so disabled/skip-copied skills are already absent),
-  # in the image, before the Linux chown below reclaims ownership to uid 1000.
+  # in the image as uid 1000 — which now owns the tree, so node_modules /
+  # .python-site are writable and end up uid-1000-owned like the rest.
   allow_scripts="$(jq -r '.allowInstallScripts // false' <<<"$row")"
   install_skill_deps "$id" "$dst" "$allow_scripts"
   install_python_deps "$id" "$dst" "$allow_scripts"
 done
-
-if [[ "$(uname -s)" == "Linux" ]]; then
-  # Skip the chown (and its sudo prompt) when ownership is already right: only
-  # run it if some path under agents/ is not already owned by uid/gid 1000.
-  if [[ -n "$(find "$CONFIG_DIR/agents" ! \( -uid 1000 -gid 1000 \) -print -quit)" ]]; then
-    log "Linux detected: chowning materialized workspaces to uid 1000"
-    if [[ "$(id -u)" -eq 0 ]]; then chown -R 1000:1000 "$CONFIG_DIR/agents"
-    else sudo chown -R 1000:1000 "$CONFIG_DIR/agents"; fi
-  fi
-fi
 
 # --- 4b. OS/system dependency preflight (AGENTS-DEPS-SPEC.md §6.3) ---------
 # Validates declared/detected OS needs against the RUNNING image; never
