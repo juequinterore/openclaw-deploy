@@ -621,17 +621,20 @@ for row in "${EFF_ROWS[@]}"; do
     rm -f "$dst/DISABLED_FEATURES.md"
   fi
   # On Linux the copy above ran as the host user (often root), so the tree is
-  # NOT owned by uid 1000. The dep installs below run in-image as `node`
-  # (uid 1000) and must create node_modules / .python-site INSIDE this tree —
-  # that fails with EACCES unless ownership is handed over FIRST. So chown this
-  # agent's workspace to uid 1000 now, before install_skill_deps/python_deps,
-  # not after the whole loop.
+  # NOT owned by uid 1000. Two in-image (uid 1000 `node`) writers need it owned
+  # by 1000: (1) the dep installs below, which create node_modules /
+  # .python-site inside workspace/; (2) the gateway at runtime, which creates
+  # sessions/ in the per-agent dir ABOVE workspace/. Both fail with EACCES
+  # unless ownership is handed over FIRST, so chown the whole per-agent dir
+  # (agents/$id, not just its workspace/ subdir) to uid 1000 now — before
+  # install_skill_deps/python_deps, and before the gateway ever runs.
+  agent_dir="$CONFIG_DIR/agents/$id"
   if [[ "$(uname -s)" == "Linux" ]]; then
     # Skip the chown (and its sudo prompt) when ownership is already right.
-    if [[ -n "$(find "$dst" ! \( -uid 1000 -gid 1000 \) -print -quit)" ]]; then
-      log "    Linux: chowning $id workspace to uid 1000 (before dep install)"
-      if [[ "$(id -u)" -eq 0 ]]; then chown -R 1000:1000 "$dst"
-      else sudo chown -R 1000:1000 "$dst"; fi
+    if [[ -n "$(find "$agent_dir" ! \( -uid 1000 -gid 1000 \) -print -quit)" ]]; then
+      log "    Linux: chowning $id agent dir to uid 1000 (before dep install)"
+      if [[ "$(id -u)" -eq 0 ]]; then chown -R 1000:1000 "$agent_dir"
+      else sudo chown -R 1000:1000 "$agent_dir"; fi
     fi
   fi
   # Install any npm-based / Python skill deps that shipped a lockfile. Runs on
