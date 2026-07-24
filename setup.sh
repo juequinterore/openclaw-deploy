@@ -224,7 +224,35 @@ else
 $RESULT"
 fi
 
-# --- 9. Optional: sync pluggable agents behind the coordinator ------------
+# --- 9. Optional: wire up Slack if tokens are present in .env -------------
+# .env.example ships SLACK_BOT_TOKEN/SLACK_APP_TOKEN commented out under
+# "Optional channel env fallbacks" — nothing forwards them into the container
+# or the gateway config on its own. If the user has uncommented and filled
+# them in, do the `channels add` step for them here instead of leaving it as
+# a manual DEPLOYMENT.md step. Passed via `docker compose run -e` (not added
+# to docker-compose.yml's `environment:` block) since that file is vendored
+# from upstream and diffed on every version bump — keeping it untouched
+# avoids upgrade-diff noise for a repo-local convenience step.
+if grep -qE '^SLACK_BOT_TOKEN=.+' .env && grep -qE '^SLACK_APP_TOKEN=.+' .env; then
+  SLACK_STATUS=$(docker compose run --rm openclaw-cli channels list 2>/dev/null | grep -i '^- Slack' || true)
+  if [[ "$SLACK_STATUS" == *"configured"* && "$SLACK_STATUS" != *"not configured"* ]]; then
+    log "Slack already configured, skipping (channels list: ${SLACK_STATUS})"
+  else
+    log "SLACK_BOT_TOKEN/SLACK_APP_TOKEN found in .env — wiring up Slack"
+    SLACK_BOT_TOKEN=$(grep -E '^SLACK_BOT_TOKEN=' .env | head -1 | cut -d= -f2-)
+    SLACK_APP_TOKEN=$(grep -E '^SLACK_APP_TOKEN=' .env | head -1 | cut -d= -f2-)
+    docker compose run --rm openclaw-cli channels add --channel slack \
+      --bot-token "$SLACK_BOT_TOKEN" --app-token "$SLACK_APP_TOKEN" \
+      || fail "Slack channel setup failed. Check SLACK_BOT_TOKEN/SLACK_APP_TOKEN in .env."
+    log "Slack configured. Restarting gateway to apply."
+    docker compose restart openclaw-gateway
+    sleep 5
+  fi
+else
+  log "No SLACK_BOT_TOKEN/SLACK_APP_TOKEN in .env, skipping Slack setup (see 'Wire up Slack' in DEPLOYMENT.md)"
+fi
+
+# --- 10. Optional: sync pluggable agents behind the coordinator -----------
 if [[ "$SYNC_AGENTS" -eq 1 ]]; then
   log "Syncing agents (agents.manifest.json5)"
   if [[ "${#PRUNE_ARGS[@]}" -gt 0 ]]; then
@@ -235,4 +263,3 @@ if [[ "$SYNC_AGENTS" -eq 1 ]]; then
 fi
 
 log "Done. Try: docker compose run --rm -it openclaw-cli chat"
-echo "To add Slack, see the 'Wire up Slack' section in DEPLOYMENT.md."

@@ -485,6 +485,11 @@ on the VPS.
 ### 5. Wire up Slack
 Requires a Slack app with **Socket Mode** enabled — a bot token (`xoxb-...`)
 and an app-level token (`xapp-...`) from api.slack.com.
+
+Easiest path: set `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` in `.env` *before*
+running `setup.sh` — it detects them and runs `channels add` for you
+(idempotent; skips if Slack is already configured). Otherwise, do it
+manually any time:
 ```bash
 docker compose run --rm openclaw-cli channels add --channel slack \
   --bot-token "xoxb-..." --app-token "xapp-..."
